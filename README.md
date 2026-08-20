@@ -202,10 +202,13 @@ vpngw/            the daemon and CLI
   pools.py        member selection and failover
   dnsmgr.py       per-egress resolvers
   leaktest.py     the proof harness
+  auth.py         panel password and sessions
+  net/apply.py    uplink changes, with the rollback that makes them survivable
   api.py, web/    HTTP API and UI
 hyperv/           PowerShell provisioning for the Windows side
-debian/           systemd-networkd and sysctl configuration
+debian/           sysctl and network configuration shipped to /etc
 systemd/          unit files
+scripts/          prepare-image.sh, for building a distributable disk
 tests/            stdlib-only, runs on the gateway itself
 ```
 
@@ -221,6 +224,29 @@ Read [docs/killswitch.md](docs/killswitch.md#what-this-does-not-protect-against)
 before relying on this. In short: it cannot help a client VM that has a second
 network adapter on an External switch, and it does not defend the Hyper-V host
 itself. Both are configuration discipline, not something a gateway can enforce.
+
+## Distributing an image
+
+`scripts/prepare-image.sh` strips a working gateway back to something safe to
+hand to somebody else, and arms a first-boot service to regenerate what has to
+be unique per machine:
+
+```bash
+sudo scripts/prepare-image.sh
+sudo poweroff
+```
+
+It removes the database (tunnels, clients, pools, the admin password), the
+secrets directory, the shell history, the logs — and the SSH host keys, which
+are the ones that matter most. An image whose users all share a host key
+cannot detect a man in the middle, and everybody who used the image before has
+already trained themselves to click through the warning that would have shown
+it. On first boot the new machine generates its own keys and machine ID, and
+the panel asks for a password.
+
+A `.vhdx` is the convenient option for Hyper-V, but it ages: the Debian
+packages inside it are frozen at the day it was built. Installing from
+`install.sh` on a current Debian is the version that stays correct.
 
 ## Licence
 
