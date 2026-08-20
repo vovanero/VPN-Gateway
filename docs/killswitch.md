@@ -115,7 +115,45 @@ others a working v6 path; and the firewall table being `inet` family, so the
 `vpngwctl selftest` pings a v6 address from the test client and fails if it
 gets an answer.
 
-## Layer 7 — DNS is taken, not offered
+## Layer 7 — the gateway does not tell clients to route around it
+
+Every layer above assumes the client's packets arrive here. An ICMP redirect
+breaks that assumption at the source: it is the router saying "for this
+destination, stop sending to me and use that other router instead". The client
+installs the route and complies. From then on its traffic never touches this
+box at all — no rule is consulted, no counter moves, and `selftest` finds
+nothing wrong, because there is nothing here to find. The machine is simply on
+the internet with its own address.
+
+This is not a remote possibility in the layout this project targets. Clients
+usually share a segment with the real router, which is exactly the condition a
+redirect is generated for: a packet that arrives on an interface and leaves by
+the same one, toward a next hop the sender could have reached directly. An
+unregistered client — one whose packets carry no mark and therefore use the
+main table — meets it on the first packet it sends.
+
+The fix is one sysctl, with one trap in it:
+
+```
+net.ipv4.conf.all.send_redirects = 0        # not sufficient on its own
+net.ipv4.conf.<iface>.send_redirects = 0    # this is the one that counts
+```
+
+The kernel combines this setting with **or**, not **and** (`IN_DEV_ORCONF`).
+Setting `conf.all` alone leaves it enabled on every interface that already has
+it set, which on Debian is all of them. `harden_sysctls()` therefore walks
+`/proc/sys/net/ipv4/conf/*` and clears each one by name, including interfaces
+created later, and `/etc/sysctl.d/99-vpngw.conf` carries `conf.default` so new
+ones start correct.
+
+Note also where the redirect is emitted: `ip_forward()` sends it *before* the
+netfilter `FORWARD` hook runs. Dropping the packet in the firewall does not
+suppress the redirect that was already generated for it. The firewall cannot
+close this one; only the sysctl can.
+
+`vpngwctl selftest` fails if any interface still has it on.
+
+## Layer 8 — DNS is taken, not offered
 
 The clients are statically addressed, so nothing hands them a resolver, and any
 of them could be pointed at `8.8.8.8` by hand. So the gateway does not offer a
