@@ -232,6 +232,7 @@ hand to somebody else, and arms a first-boot service to regenerate what has to
 be unique per machine:
 
 ```bash
+sudo scripts/prepare-image.sh --dry-run   # lists what would go, changes nothing
 sudo scripts/prepare-image.sh
 sudo poweroff
 ```
