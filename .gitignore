@@ -1,0 +1,50 @@
+# Runtime state. None of this belongs in a repository, and some of it must
+# never leave the machine that generated it.
+
+# Keys and credentials. /etc/vpngw/secrets holds WireGuard private keys, the
+# root-only CLI token, and provider account numbers; the database holds the
+# admin password hash and every imported tunnel. A copy of either is a copy of
+# the whole gateway.
+secrets/
+*.key
+*.pem
+*.ovpn
+*.conf.local
+vpngw.db
+vpngw.db-*
+*.sqlite
+*.sqlite3
+
+# Generated at install or run time, never edited by hand.
+/etc/
+/run/
+/var/
+*.generated.nft
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+venv/
+.venv/
+
+# Test and tooling leftovers
+.preview/
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# Editors and platforms
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local agent configuration
+.claude/

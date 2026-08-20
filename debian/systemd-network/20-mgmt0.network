@@ -1,0 +1,16 @@
+# Management segment: the Hyper-V Internal switch, shared only with the
+# Windows host (10.20.0.2).
+#
+# The web UI and SSH are reachable here and nowhere else - the firewall's input
+# chain accepts ports 22 and 8080 on this interface only, and drops them on
+# both the client bridge and the uplink. Clients cannot reach the gateway's
+# management plane at all.
+
+[Match]
+Name=mgmt0
+
+[Network]
+Address=10.20.0.1/24
+DHCP=no
+IPv6AcceptRA=no
+LinkLocalAddressing=no

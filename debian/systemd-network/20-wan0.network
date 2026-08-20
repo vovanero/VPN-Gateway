@@ -1,0 +1,22 @@
+# Uplink toward the Hyper-V External switch.
+#
+# This is the ONLY interface that reaches the internet directly, and the
+# firewall's forward chain names it explicitly as somewhere forwarded traffic
+# may never go.
+
+[Match]
+Name=wan0
+
+[Network]
+DHCP=ipv4
+# No IPv6 on the uplink: nothing on this box carries v6, and a v6 default
+# route here would be a path the v4 policy routing knows nothing about.
+LinkLocalAddressing=no
+IPv6AcceptRA=no
+
+[DHCPv4]
+UseDNS=true
+UseDomains=false
+# The gateway's own resolver must stay under our control; a DHCP-supplied
+# hostname from the upstream network is noise at best.
+UseHostname=false

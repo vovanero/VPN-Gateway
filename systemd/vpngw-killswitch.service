@@ -1,0 +1,35 @@
+[Unit]
+Description=vpngw fail-closed firewall skeleton
+Documentation=file:/usr/share/doc/vpngw/killswitch.md
+
+# This unit is the reason a boot cannot leak.
+#
+# It loads a ruleset whose forward chain drops everything, and it does so
+# before network-pre.target - that is, before systemd-networkd has brought a
+# single interface up. Between the kernel initialising the NICs and vpngw
+# finishing its first reconcile there is no window in which a client VM could
+# forward a packet, because forwarding is already denied when the interfaces
+# appear.
+#
+# It also covers the failure case that matters most: if vpngw itself never
+# starts - a bad upgrade, a corrupt database, Python broken - the box stays in
+# exactly this state. Clients get no internet. They do not get unencrypted
+# internet.
+DefaultDependencies=no
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+After=systemd-sysctl.service
+ConditionPathExists=/etc/vpngw/killswitch.nft
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+StandardInput=null
+ExecStart=/usr/sbin/nft -f /etc/vpngw/killswitch.nft
+
+# Deliberately no ExecStop. Stopping this unit must not flush the ruleset:
+# "systemctl stop" on a firewall should never be the thing that opens the gate.
+# Removing the rules is an explicit operator action - see `vpngwctl teardown`.
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,31 @@
+[Unit]
+Description=vpngw DNS resolver for egress %i
+Requires=vpngw-killswitch.service
+After=vpngw-killswitch.service
+ConditionPathExists=/run/vpngw/dns/%i.conf
+
+# One resolver per tunnel and per pool, each bound to its own address in the
+# resolver subnet. Client :53 traffic is DNAT-ed to the one belonging to that
+# client's egress, so a lookup travels the same tunnel as the traffic it is
+# for - and stops when that tunnel stops.
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq --keep-in-foreground --log-facility=- \
+          --conf-file=/run/vpngw/dns/%i.conf
+Restart=always
+# The bind fails until vpngw has put the resolver address on the dummy
+# interface, so early restarts are expected and harmless.
+RestartSec=3
+StartLimitBurst=0
+
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/run/vpngw
+PrivateDevices=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

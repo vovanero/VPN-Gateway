@@ -1,0 +1,12 @@
+# The physical client-facing NIC, enslaved into br-lan.
+#
+# It gets no address of its own: the bridge holds 10.10.0.1/24. An address here
+# as well would create a second, unpoliced path onto the client segment.
+
+[Match]
+Name=lan0
+
+[Network]
+Bridge=br-lan
+LinkLocalAddressing=no
+IPv6AcceptRA=no

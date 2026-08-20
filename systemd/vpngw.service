@@ -1,0 +1,37 @@
+[Unit]
+Description=vpngw multi-VPN gateway control plane
+Documentation=file:/usr/share/doc/vpngw/README.md
+Requires=vpngw-killswitch.service
+After=vpngw-killswitch.service systemd-networkd.service network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -m vpngw.service
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=5
+
+# Root is required: the daemon creates interfaces, loads nftables rulesets and
+# rewrites routing tables. The hardening below is what can be applied without
+# taking away the capabilities it actually needs.
+ProtectHome=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+RuntimeDirectory=vpngw
+RuntimeDirectoryMode=0750
+# Tunnel state files under /run/vpngw must survive a control-plane restart;
+# without this, restarting vpngw would wipe what the OpenVPN up scripts wrote
+# and every tunnel would look unconfigured until it renegotiated.
+RuntimeDirectoryPreserve=yes
+StateDirectory=vpngw
+StateDirectoryMode=0750
+LogsDirectory=vpngw
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+[Unit]
+Description=vpngw OpenVPN tunnel %i
+Requires=vpngw-killswitch.service
+After=vpngw-killswitch.service network.target
+ConditionPathExists=/run/vpngw/ovpn/%i.conf
+
+# Intentionally NOT PartOf=vpngw.service. Stopping the control plane must not
+# tear down working tunnels: a gateway whose management daemon is being
+# upgraded should keep carrying traffic. If a tunnel dies while vpngw is down,
+# the kernel withdraws its routes and the policy table's blackhole takes over,
+# so the clients on it lose the internet rather than falling back to the uplink.
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/openvpn --config /run/vpngw/ovpn/%i.conf
+Restart=always
+RestartSec=5
+
+# A provider that is refusing us should not turn into a restart storm.
+StartLimitBurst=0
+
+ProtectHome=true
+ProtectKernelLogs=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

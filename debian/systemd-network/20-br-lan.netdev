@@ -1,0 +1,16 @@
+# The client-facing side is a bridge rather than the bare NIC.
+#
+# Two reasons: a second client-facing adapter can be added later without
+# redesigning anything, and `vpngwctl selftest` can attach a veth pair to it
+# and become a real LAN client. That is what turns the leak test from an
+# assertion into a measurement - the test traffic traverses the same bridge,
+# the same forward chain and the same rules as a Hyper-V VM's traffic does.
+
+[NetDev]
+Name=br-lan
+Kind=bridge
+
+[Bridge]
+# No spanning tree: this bridge has one physical member plus test veths, so STP
+# would only add up to 30 seconds of forwarding delay when a client appears.
+STP=false
