@@ -369,16 +369,16 @@ def cmd_provider_list(args, db: Database, settings) -> int:
 
     have = set(store.configured())
     for p in providers.all_providers():
-        mark = colour("yapılandırıldı", GREEN) if p.id in have else colour("—", GREY)
+        mark = colour("configured", GREEN) if p.id in have else colour("—", GREY)
         kinds = ", ".join(k.value for k in p.supports)
         print(f"{p.id:<12} {p.name:<14} {kinds:<12} {mark}")
         if p.notes:
             print(colour(f"             {p.notes}", GREY))
     print()
     print(colour(
-        "Bir sağlayıcının API'si yoksa ya da burada listelenmiyorsa, indirdiğiniz\n"
-        "yapılandırma arşivini 'vpngwctl tunnel import-bundle' ile toplu\n"
-        "aktarabilirsiniz — sonuç aynı tür tünel olur.", GREY))
+        "If a provider has no API, or is not listed here, import the\n"
+        "configuration archive you downloaded with 'vpngwctl tunnel\n"
+        "import-bundle'. The result is the same kind of tunnel.", GREY))
     return 0
 
 
@@ -440,7 +440,7 @@ def cmd_provider_login(args, db: Database, settings) -> int:
 
     store.save_credentials(provider.id, creds)
     store._save_session(provider.id, session)
-    print(colour(f"{provider.name}: giriş başarılı", GREEN))
+    print(colour(f"{provider.name}: signed in", GREEN))
     for k, v in info.items():
         if v not in (None, ""):
             print(f"  {k}: {v}")
@@ -455,7 +455,7 @@ def cmd_provider_logout(args, db: Database, settings) -> int:
         Daemon(settings).call(f"/api/providers/{args.provider}/disable", "POST", {})
     except SystemExit:
         pass
-    print(f"{args.provider}: kimlik bilgileri silindi, API erişimi kapatıldı")
+    print(f"{args.provider}: credentials removed, API access disabled")
     return 0
 
 
@@ -482,9 +482,9 @@ def cmd_provider_locations(args, db: Database, settings) -> int:
 
     shown = locations[: args.limit] if args.limit else locations
     for l in shown:
-        owned = colour(" (kendi donanımı)", GREEN) if l.owned else ""
+        owned = colour(" (provider-owned hardware)", GREEN) if l.owned else ""
         print(f"{l.id:<22} {l.city + ', ' + l.country:<28} {l.address:<16}{owned}")
-    print(colour(f"\n{len(shown)}/{len(locations)} sunucu gösterildi", GREY))
+    print(colour(f"\n{len(shown)}/{len(locations)} servers shown", GREY))
     return 0
 
 
@@ -533,7 +533,7 @@ def cmd_provider_add(args, db: Database, settings) -> int:
             f"no location matching {args.location!r}. "
             f"Try 'vpngwctl provider locations {provider.id}'.")
     if len(match) > 1 and not args.first:
-        print(colour(f"{len(match)} sunucu eşleşti:", YELLOW), file=sys.stderr)
+        print(colour(f"{len(match)} servers matched:", YELLOW), file=sys.stderr)
         for l in match[:10]:
             print(f"  {l.id:<22} {l.city}, {l.country}", file=sys.stderr)
         raise SystemExit("be more specific, or pass --first")
@@ -547,11 +547,11 @@ def cmd_provider_add(args, db: Database, settings) -> int:
         raise SystemExit(colour(str(exc), RED))
 
     tunnel = _tunnel_from_remote(db, slug, args.name or location.label, remote)
-    print(colour(f"eklendi: {tunnel.slug}", GREEN)
-          + f"  {tunnel.name}  ({tunnel.iface}, tablo {tunnel.table})")
-    print(f"  uç nokta: {remote.endpoint}")
-    print(f"  adres   : {', '.join(remote.addresses)}")
-    print(f"  DNS     : {', '.join(remote.dns) or 'sağlayıcı belirtmedi'}")
+    print(colour(f"added: {tunnel.slug}", GREEN)
+          + f"  {tunnel.name}  ({tunnel.iface}, table {tunnel.table})")
+    print(f"  endpoint: {remote.endpoint}")
+    print(f"  address : {', '.join(remote.addresses)}")
+    print(f"  DNS     : {', '.join(remote.dns) or 'none supplied by the provider'}")
     Daemon(settings).nudge()
     return 0
 
@@ -616,14 +616,14 @@ def cmd_provider_devices(args, db: Database, settings) -> int:
         raise SystemExit(colour(str(exc), RED))
 
     if not devices:
-        print(colour("kayıtlı cihaz yok", GREY))
+        print(colour("no registered devices", GREY))
         return 0
     for d in devices:
         print(f"{d['id']:<38} {d.get('name', ''):<24} {d.get('ipv4', '')}")
     if provider.device_limit:
         used = len(devices)
         tone = RED if used >= provider.device_limit else GREY
-        print(colour(f"\n{used}/{provider.device_limit} cihaz kullanılıyor", tone))
+        print(colour(f"\n{used}/{provider.device_limit} device slots used", tone))
     return 0
 
 
@@ -636,7 +636,7 @@ def cmd_provider_device_rm(args, db: Database, settings) -> int:
         provider.remove_device(store.session_for(provider), args.device_id)
     except ProviderError as exc:
         raise SystemExit(colour(str(exc), RED))
-    print(colour(f"cihaz silindi: {args.device_id}", GREEN))
+    print(colour(f"device removed: {args.device_id}", GREEN))
     return 0
 
 

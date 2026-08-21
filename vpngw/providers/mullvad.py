@@ -56,10 +56,10 @@ class Mullvad(Provider):
     auth_fields = [
         AuthField(
             key="account_number",
-            label="Hesap numarası",
+            label="Account number",
             secret=True,
-            help="Mullvad hesabınızdaki 16 haneli numara. Kullanıcı adı ve "
-                 "parola yoktur.",
+            help="The 16-digit number on your Mullvad account. There is no "
+                 "username and no password.",
             placeholder="1234567890123456",
         ),
     ]
