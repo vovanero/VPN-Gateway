@@ -29,119 +29,48 @@ against commercial providers and your own servers.
 
 ## How it works
 
-Three mechanisms carry the whole design. Everything else is bookkeeping.
-
-### 1. One packet's journey
-
-A client's packet is classified by its **source address**, marked, and routed
-by its own table. The mark is the only way into a tunnel — and an unregistered
-machine never gets one.
+Each client is recognised by its source address, marked, and routed by its own
+table toward its assigned VPN. Everything the project promises is visible in
+what happens to the *other* arrows:
 
 ```mermaid
 flowchart LR
-    C["Client VM
-10.10.0.2
-gw 10.10.0.1"] -->|packet| M{"cli2mark
-source address
-registered?"}
-    M -->|"no mark"| DROP1["forward chain
-policy drop
-✕ discarded"]
-    M -->|"mark 0x1"| T["policy routing
-table 101"]
-    T --> R{"tunnel route
-present?"}
-    R -->|"tunnel up"| WG["wg-ca01
-masquerade"] --> NET(("internet
-exit = VPN IP"))
-    R -->|"tunnel down
-route withdrawn"| BH["blackhole default
-metric 1000
-✕ discarded"]
+    C["client VM
+10.10.0.2 · gw 10.10.0.1"] --> GW{"registered?"}
+    U["unknown machine"] --> GW
+    GW -->|"no"| D1["✕ dropped
+forward policy drop"]
+    GW -->|"mark 0x1 →
+routing table 101"| T{"its tunnel
+up?"}
+    T -->|"yes"| V["wg-ca01"] --> I(("internet
+exit = VPN address"))
+    T -->|"no — route withdrawn,
+even if the daemon is dead"| D2["✕ blackhole
+no fallback to the uplink"]
+    C -.->|"DNS to any server"| R["forced through its
+own tunnel's resolver"]
 
-    style DROP1 fill:#7f1d1d,color:#fff
-    style BH fill:#7f1d1d,color:#fff
-    style WG fill:#14532d,color:#fff
-    style NET fill:#14532d,color:#fff
-```
-
-The blackhole route is the part that matters. When a tunnel dies the kernel
-withdraws its routes by itself, leaving only the discard route — so clients
-lose the internet **even if the vpngw daemon has crashed, been stopped, or
-never started**. The kill switch does not depend on its own process being
-alive.
-
-### 2. Why nothing can leak
-
-Independent layers, each of which survives the failure of the ones above it:
-
-```mermaid
-flowchart TB
-    P["client packet trying to reach the internet"] --> L1
-
-    L1{"1 · nftables forward chain
-accepts only client→tunnel"} -->|"any other path"| X1["✕ drop"]
-    L1 -->|"toward a tunnel"| L2{"2 · per-client routing table
-tunnel route or blackhole"}
-    L2 -->|"tunnel down"| X2["✕ blackhole
-works with the daemon dead"]
-    L2 --> L3{"3 · uplink named explicitly
-oifname wan → drop"}
-    L3 -->|"somehow toward wan"| X3["✕ wan_leak_drop counter"]
-    L3 --> OK["tunnel only
-✓"]
-
-    B["boot window,
-daemon not started yet"] --> L4["killswitch.nft loads
-before network-pre.target
-ip_forward = 0 until a
-ruleset is loaded"] --> X4["✕ nothing forwarded"]
-
-    style X1 fill:#7f1d1d,color:#fff
-    style X2 fill:#7f1d1d,color:#fff
-    style X3 fill:#7f1d1d,color:#fff
-    style X4 fill:#7f1d1d,color:#fff
-    style OK fill:#14532d,color:#fff
-```
-
-DNS gets the same treatment rather than trust: every `:53` packet from a
-client is DNAT-ed to a resolver **bound to that client's own tunnel**, so a
-machine hard-coding `8.8.8.8` is answered through its VPN anyway — queries
-cannot name-leak past the tunnel.
-
-```mermaid
-flowchart LR
-    C["client asks 8.8.8.8"] --> D["nat prerouting
-dport 53 → cli2dns"] --> R["dnsmasq on 10.99.0.1
-bound to wg-ca01's address"] --> U["upstream resolver
-through the tunnel"]
+    style D1 fill:#7f1d1d,color:#fff
+    style D2 fill:#7f1d1d,color:#fff
+    style V fill:#14532d,color:#fff
+    style I fill:#14532d,color:#fff
     style R fill:#1e3a8a,color:#fff
 ```
 
-### 3. Pools: failover with hysteresis
+The blackhole is the heart of it. Every per-client table carries a discard
+route at low priority; the tunnel's real route sits above it. When a tunnel
+dies the kernel withdraws its route **by itself**, leaving only the discard —
+so clients stop reaching the internet even if the vpngw daemon has crashed,
+been stopped, or never started. The kill switch does not depend on its own
+process being alive.
 
-A client can point at a **pool** instead of one tunnel. Health probes with
-hysteresis pick the member; failover moves every client on the pool at once,
-and stickiness stops them flapping back.
-
-```mermaid
-stateDiagram-v2
-    [*] --> Primary : pool eu = [ca01, nl01]
-    Primary --> Failover : ca01 fails 3 probes
-(hysteresis, not one loss)
-    Failover --> Primary : operator moves it back
-    Failover --> Blackhole : nl01 dies too
-    Blackhole --> Failover : any member recovers
-    Primary : traffic → ca01
-    Failover : traffic → nl01
-sticky - no flap-back
-    Blackhole : no healthy member
-clients blocked, not leaked
-```
-
-Measured on a live gateway: the exit IP moved `149.22.81.199 →
-193.32.249.138` seventeen seconds after the primary was killed, and with every
-member down the client was blocked — not handed to the uplink.
+The same thinking is applied everywhere without further diagrams: DNS is
+DNAT-ed to a per-tunnel resolver so a hard-coded `8.8.8.8` still resolves
+through the VPN; pools fail over with hysteresis and stickiness (measured:
+17 s, and with every member down the client is blocked, not leaked); and
+management is per interface — panel and SSH answer on the LAN by default, on
+the uplink only if you tick it.
 
 ## What makes it different
 
@@ -176,74 +105,107 @@ clients stop reaching the internet **even if vpngw has crashed, been stopped,
 or was never started.** The kill switch does not depend on the kill switch's
 own process being alive.
 
-## Quick start
+## Installation
 
-On the Windows host, in an elevated PowerShell:
+What you need: a Debian 13 VM with **two network adapters** — one facing the
+internet (WAN), one facing the machines you want tunnelled (LAN) — and root on
+it. Nothing else; the installer brings in every package.
+
+### 1 · Create the VM
+
+On a Hyper-V host, the provisioning script builds the switches and the VM with
+the right settings (MAC spoofing on, router guard off — the defaults break
+routing VMs):
 
 ```powershell
 .\hyperv\New-VpnGwLab.ps1 -UplinkAdapter "Ethernet" -IsoPath D:\iso\debian-13-netinst.iso
 ```
 
-Install Debian 13 (SSH server + standard utilities only — no desktop), then on
-the VM:
+Building the VM by hand instead? Two adapters, and on the LAN adapter enable
+**MAC address spoofing** (VM Settings → Network Adapter → Advanced Features).
+Any other hypervisor or bare metal works the same way: two NICs, Debian 13.
+
+Install Debian 13 from the netinst ISO — SSH server and standard utilities
+only, no desktop.
+
+### 2 · Install vpngw
+
+On the VM:
 
 ```bash
+git clone https://github.com/vovanero/VPN-Gateway.git
+cd VPN-Gateway
 sudo ./install.sh
 ```
 
-The installer detects the layout, walks you through it, and refuses anything
-that would leave the box unreachable. Set `VPNGW_NONINTERACTIVE=1` together
-with `VPNGW_WAN` / `VPNGW_LAN` / `VPNGW_ADMIN_CIDR` to provision it without
-prompts.
+The installer detects which adapter is which, then walks through a short
+wizard — uplink address (static or DHCP), client network, whether management
+should also answer on the uplink — and refuses any configuration that would
+leave the box unreachable. Then it installs packages, writes the fail-closed
+boot skeleton, and starts the service. A few minutes end to end.
 
-Then import a tunnel and point a client at it:
+For unattended provisioning, skip the wizard:
+
+```bash
+sudo VPNGW_NONINTERACTIVE=1 VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_WAN=1 ./install.sh
+```
+
+| Variable | Meaning |
+|---|---|
+| `VPNGW_WAN` / `VPNGW_LAN` | which adapter faces the internet / the clients |
+| `VPNGW_LAN_CIDR` | gateway's LAN address, default `10.10.0.1/24` |
+| `VPNGW_ADMIN_WAN=1` | panel + SSH also answer on the uplink |
+| `VPNGW_NONINTERACTIVE=1` | no prompts; take the values above |
+
+### 3 · First sign-in
+
+Open `http://10.10.0.1:8080` from any machine on the LAN side. A fresh
+install has no password — the first visit asks you to set one.
+
+### 4 · Add a tunnel and a client
+
+In the panel: **VPN providers** → pick one → sign in → choose a server. Or
+from any WireGuard/OpenVPN config file:
 
 ```bash
 vpngwctl tunnel import nl01 ~/mullvad-nl.conf --name "Mullvad Amsterdam"
 vpngwctl client add pc01 10.10.0.11 --egress tunnel:nl01
-vpngwctl status
 ```
 
-A pool that fails over between three tunnels, with clients on the pool rather
-than on any one tunnel:
+On the client machine itself, set a static address in the LAN network and
+point its gateway at the box — nothing to install:
+
+```
+address  10.10.0.11
+netmask  255.255.255.0
+gateway  10.10.0.1
+DNS      anything - it is intercepted
+```
+
+Machines you have not registered appear on the **Clients** page with a
+one-click Register button; until registered they are blocked, by design.
+
+A pool that fails over between tunnels, with clients on the pool rather than
+any one tunnel:
 
 ```bash
 vpngwctl pool create eu --strategy priority --members nl01 de01 se01
 vpngwctl client assign 10.10.0.12 pool:eu
 ```
 
+### 5 · Prove it
+
+```bash
+vpngwctl status                    # kill switch armed, tunnels up, clients assigned
+sudo vpngwctl selftest --disrupt   # the leak test - see below
+```
+
 ## The panel
 
 `http://10.10.0.1:8080` — the gateway's LAN address, like any router. Which
-interfaces the panel and SSH answer on is itself a panel setting: tick boxes,
-apply, and the firewall rebuilds immediately, no restart.
-
-```mermaid
-flowchart LR
-    subgraph choices["Settings → Access control"]
-        LAN["☑ LAN br-lan
-default on"]
-        MGMT["☑ MGMT mgmt0
-when present"]
-        WAN["☐ WAN eth0
-off until you tick it"]
-    end
-    OP1["operator on the
-client network"] --> LAN --> P["web panel + SSH
-password on top"]
-    OP2["Hyper-V host on the
-management switch"] --> MGMT --> P
-    OP3["anything that can
-reach the uplink"] -.->|"only if ticked"| WAN -.-> P
-    C["client VMs' forwarded
-traffic"] --> KS["kill switch:
-tunnel or nothing
-— never the panel ports"]
-
-    style P fill:#1e3a8a,color:#fff
-    style KS fill:#7f1d1d,color:#fff
-    style WAN stroke-dasharray: 5 5
-```
+interfaces the panel and SSH answer on is itself a panel setting — tick
+LAN / WAN / MGMT boxes, apply, and the firewall rebuilds immediately, no
+restart.
 
 Management is per interface — a property of which side of the box you stand
 on, not of your source address. Unticking every box is refused: a fail-closed
