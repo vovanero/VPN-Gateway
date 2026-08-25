@@ -130,6 +130,22 @@ def map_entries(name: str) -> dict[str, str]:
     return out
 
 
+def _canon_value(value: str) -> str:
+    """Map values as comparable text.
+
+    We write marks as `0x0001`; the kernel prints them back as `1`. Comparing
+    those spellings directly means every pass sees a difference and rewrites
+    the map - the same disease :func:`_bare` cures for set members, moved to
+    values. The rewrite is not just log noise: a delete window on cli2mark is
+    a moment in which a client's packets carry no mark and are dropped.
+    """
+    value = _bare(value)
+    try:
+        return str(int(value, 0))
+    except ValueError:
+        return value
+
+
 def sync_map(name: str, want: dict[str, str]) -> None:
     """Reconcile a map's contents.
 
@@ -137,7 +153,8 @@ def sync_map(name: str, want: dict[str, str]) -> None:
     client is never briefly mapped to the wrong egress.
     """
     have = map_entries(name)
-    stale = {k for k in have if k not in want or have[k] != want[k]}
+    stale = {k for k in have
+             if k not in want or _canon_value(have[k]) != _canon_value(want[k])}
     for key in sorted(stale):
         try_run(["nft", "delete", "element", FAMILY, TABLE, name,
                  "{", key, ":", have[key], "}"])

@@ -78,6 +78,30 @@ def ensure_bridge(bridge: str, member: str) -> None:
         log.info("enslaved %s into %s", member, bridge)
     run(["ip", "link", "set", "up", "dev", member])
 
+    # The bridge speaks with the member's MAC, always. The kernel gives a new
+    # bridge a random address, and under Hyper-V that is fatal in a way
+    # nothing on this box can see: with MAC spoofing off (the default), the
+    # virtual switch silently drops any frame whose source MAC is not the one
+    # it assigned to the vNIC. Inbound traffic still arrives, so the gateway
+    # sees clients ARP for it - it just cannot answer them. From the client
+    # that is "destination host unreachable" to an address that is provably
+    # up; from here, nothing is wrong anywhere.
+    #
+    # Pinning also stops the address drifting when the leak test attaches its
+    # veth - an explicitly-set bridge MAC no longer follows the members.
+    member_mac = entry.get("address", "")
+    if member_mac:
+        res = try_run(["ip", "-json", "link", "show", "dev", bridge])
+        try:
+            bridge_mac = json.loads(res.stdout or "[]")[0].get("address", "")
+        except (ValueError, IndexError):
+            bridge_mac = ""
+        if bridge_mac.lower() != member_mac.lower():
+            run(["ip", "link", "set", "dev", bridge, "address", member_mac])
+            log.warning("bridge %s MAC pinned to %s (was %s) - a random "
+                        "bridge MAC is dropped by Hyper-V unless spoofing "
+                        "is enabled", bridge, member_mac, bridge_mac)
+
 
 def ensure_address(iface: str, cidr: str) -> None:
     if not exists(iface):

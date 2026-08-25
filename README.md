@@ -27,6 +27,122 @@ against commercial providers and your own servers.
    └───────────────────────────────────────────────────────┘
 ```
 
+## How it works
+
+Three mechanisms carry the whole design. Everything else is bookkeeping.
+
+### 1. One packet's journey
+
+A client's packet is classified by its **source address**, marked, and routed
+by its own table. The mark is the only way into a tunnel — and an unregistered
+machine never gets one.
+
+```mermaid
+flowchart LR
+    C["Client VM
+10.10.0.2
+gw 10.10.0.1"] -->|packet| M{"cli2mark
+source address
+registered?"}
+    M -->|"no mark"| DROP1["forward chain
+policy drop
+✕ discarded"]
+    M -->|"mark 0x1"| T["policy routing
+table 101"]
+    T --> R{"tunnel route
+present?"}
+    R -->|"tunnel up"| WG["wg-ca01
+masquerade"] --> NET(("internet
+exit = VPN IP"))
+    R -->|"tunnel down
+route withdrawn"| BH["blackhole default
+metric 1000
+✕ discarded"]
+
+    style DROP1 fill:#7f1d1d,color:#fff
+    style BH fill:#7f1d1d,color:#fff
+    style WG fill:#14532d,color:#fff
+    style NET fill:#14532d,color:#fff
+```
+
+The blackhole route is the part that matters. When a tunnel dies the kernel
+withdraws its routes by itself, leaving only the discard route — so clients
+lose the internet **even if the vpngw daemon has crashed, been stopped, or
+never started**. The kill switch does not depend on its own process being
+alive.
+
+### 2. Why nothing can leak
+
+Independent layers, each of which survives the failure of the ones above it:
+
+```mermaid
+flowchart TB
+    P["client packet trying to reach the internet"] --> L1
+
+    L1{"1 · nftables forward chain
+accepts only client→tunnel"} -->|"any other path"| X1["✕ drop"]
+    L1 -->|"toward a tunnel"| L2{"2 · per-client routing table
+tunnel route or blackhole"}
+    L2 -->|"tunnel down"| X2["✕ blackhole
+works with the daemon dead"]
+    L2 --> L3{"3 · uplink named explicitly
+oifname wan → drop"}
+    L3 -->|"somehow toward wan"| X3["✕ wan_leak_drop counter"]
+    L3 --> OK["tunnel only
+✓"]
+
+    B["boot window,
+daemon not started yet"] --> L4["killswitch.nft loads
+before network-pre.target
+ip_forward = 0 until a
+ruleset is loaded"] --> X4["✕ nothing forwarded"]
+
+    style X1 fill:#7f1d1d,color:#fff
+    style X2 fill:#7f1d1d,color:#fff
+    style X3 fill:#7f1d1d,color:#fff
+    style X4 fill:#7f1d1d,color:#fff
+    style OK fill:#14532d,color:#fff
+```
+
+DNS gets the same treatment rather than trust: every `:53` packet from a
+client is DNAT-ed to a resolver **bound to that client's own tunnel**, so a
+machine hard-coding `8.8.8.8` is answered through its VPN anyway — queries
+cannot name-leak past the tunnel.
+
+```mermaid
+flowchart LR
+    C["client asks 8.8.8.8"] --> D["nat prerouting
+dport 53 → cli2dns"] --> R["dnsmasq on 10.99.0.1
+bound to wg-ca01's address"] --> U["upstream resolver
+through the tunnel"]
+    style R fill:#1e3a8a,color:#fff
+```
+
+### 3. Pools: failover with hysteresis
+
+A client can point at a **pool** instead of one tunnel. Health probes with
+hysteresis pick the member; failover moves every client on the pool at once,
+and stickiness stops them flapping back.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Primary : pool eu = [ca01, nl01]
+    Primary --> Failover : ca01 fails 3 probes
+(hysteresis, not one loss)
+    Failover --> Primary : operator moves it back
+    Failover --> Blackhole : nl01 dies too
+    Blackhole --> Failover : any member recovers
+    Primary : traffic → ca01
+    Failover : traffic → nl01
+sticky - no flap-back
+    Blackhole : no healthy member
+clients blocked, not leaked
+```
+
+Measured on a live gateway: the exit IP moved `149.22.81.199 →
+193.32.249.138` seventeen seconds after the primary was killed, and with every
+member down the client was blocked — not handed to the uplink.
+
 ## What makes it different
 
 Plenty of routers can send different clients through different VPNs. The part

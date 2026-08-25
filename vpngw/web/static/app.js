@@ -1967,11 +1967,30 @@ function renderSettings(host) {
           + "because neither clients nor the uplink can reach it at all.",
           el("select", { name: "mgmt_iface" },
             ...ifaceOptions(n, net.mgmt_iface, true))),
-        settingRow("Admin source range",
-          "Used when there is no management interface: SSH and this panel are "
-          + "accepted on the uplink from this range only. Narrow it to your "
-          + "own address with /32 if you can.",
-          networkField("admin_cidr", net.admin_cidr, "192.168.1.0/24")),
+        el("div", { class: "setting-row" },
+          el("div", {}, el("b", {}, "Management access"),
+            el("small", {}, "Interfaces this panel and SSH answer on — like "
+              + "any router: managed from inside. Ticking the uplink exposes "
+              + "the sign-in page to everything that can reach that "
+              + "interface, so leave it off unless you administer from "
+              + "there.")),
+          el("div", {}, ...n.all_interfaces.concat([net.lan_bridge])
+            .filter((v, i, a) => a.indexOf(v) === i)
+            .map((name) => {
+              const active = (net.admin_ifaces || []).length
+                ? net.admin_ifaces.includes(name)
+                : (name === net.lan_bridge || name === net.mgmt_iface);
+              return el("label", {
+                style: "display:flex;gap:8px;align-items:center;padding:4px 0;"
+                     + "font-size:13px;cursor:pointer" },
+                el("input", {
+                  type: "checkbox", name: "aif_" + name, style: "width:auto",
+                  checked: active,
+                }),
+                el("span", { class: "mono" }, name),
+                name === net.wan_iface
+                  ? el("span", { class: "mode-tag" }, "uplink") : null);
+            }))),
 
         el("div", { class: "setting-row" },
           el("div", {}, el("b", {}, "Accept clients from"),
@@ -2210,6 +2229,16 @@ async function saveNetwork() {
     .filter((c) => c.checked)
     .map((c) => c.name.slice(4));
 
+  const adminIfaces = [...f.querySelectorAll("input[name^=aif_]")]
+    .filter((c) => c.checked)
+    .map((c) => c.name.slice(4));
+  if (!adminIfaces.length) {
+    toast("err", "No management access left",
+          "At least one interface must keep panel and SSH access — otherwise "
+          + "nobody can administer the gateway, including you, right now.");
+    return;
+  }
+
   const body = {
     net: {
       wan_iface: f.wan_iface.value,
@@ -2217,7 +2246,7 @@ async function saveNetwork() {
       lan_bridge: f.lan_bridge.value.trim(),
       lan_cidr: joinCidr(f.lan_address.value, f.lan_prefix.value),
       mgmt_iface: f.mgmt_iface.value,
-      admin_cidr: f.admin_cidr.value.trim(),
+      admin_ifaces: adminIfaces,
       client_ifaces: clientIfaces,
       client_cidrs: list(f.client_cidrs.value),
     },

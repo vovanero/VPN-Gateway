@@ -76,7 +76,6 @@ def render(
     # because applying this ruleset with no management path is unrecoverable
     # over the network - by design, nothing else is listening.
     mgmt = net.mgmt_iface
-    admin_cidr = net.admin_cidr
 
     enabled_tunnels = [t for t in tunnels if t.enabled]
     tun_ifaces = [f'"{t.iface}"' for t in enabled_tunnels]
@@ -115,8 +114,6 @@ define RESOLVER_NET = {resolver_net}
 """)
     if mgmt:
         a(f'define MGMT = "{mgmt}"\n')
-    if admin_cidr:
-        a(f"define ADMIN_NET   = {admin_cidr}\n")
     a("\ntable inet vpngw {\n")
 
     # -- named counters -----------------------------------------------------
@@ -279,21 +276,12 @@ define RESOLVER_NET = {resolver_net}
         icmp type { destination-unreachable, time-exceeded, parameter-problem } accept
 """)
     a("\n        # Management plane.\n")
-    if mgmt:
-        a(f"""\
-        # Dedicated interface: nothing on the uplink or the client bridge can
-        # reach SSH or the UI at all.
-        iifname $MGMT tcp dport {{ 22, {settings.api.port} }} accept
-        iifname $MGMT icmp type echo-request accept
-""")
-    if admin_cidr:
-        a(f"""\
-        # Over the uplink, restricted to one source range. Weaker than a
-        # dedicated interface - whatever else can reach the uplink can at least
-        # send packets at these ports - so the range is deliberately narrow and
-        # nothing else on this interface is accepted.
-        iifname $WAN ip saddr $ADMIN_NET tcp dport {{ 22, {settings.api.port} }} accept
-        iifname $WAN ip saddr $ADMIN_NET icmp type echo-request accept
+    for iface in net.management_ifaces():
+        a(f"""        # Management is a property of which side of the box you stand on, not
+        # of your source address. The uplink appears here only if the operator
+        # added it to admin_ifaces themselves.
+        iifname "{iface}" tcp dport {{ 22, {settings.api.port} }} accept
+        iifname "{iface}" icmp type echo-request accept
 """)
     a("""\
 
@@ -423,14 +411,9 @@ def render_killswitch(settings: Settings) -> str:
     # unreachable - fail-closed for clients is correct, but locking the
     # operator out of a box that needs fixing is just a brick.
     admin_rules = []
-    if net.mgmt_iface:
+    for iface in net.management_ifaces():
         admin_rules.append(
-            f'        iifname "{net.mgmt_iface}" tcp dport {{ 22 }} accept'
-        )
-    if net.admin_cidr:
-        admin_rules.append(
-            f'        iifname "{net.wan_iface}" ip saddr {net.admin_cidr} '
-            f'tcp dport {{ 22 }} accept'
+            f'        iifname "{iface}" tcp dport {{ 22 }} accept'
         )
     admin_block = "\n".join(admin_rules) or (
         "        # no management path configured - see [net] in vpngw.toml"

@@ -10,7 +10,7 @@
 # The topology is detected rather than assumed. Override anything with an
 # environment variable:
 #
-#   VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_CIDR=192.168.1.0/24 ./install.sh
+#   VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_WAN=1 ./install.sh
 #
 set -euo pipefail
 
@@ -91,25 +91,18 @@ fi
 # Same again - a box with only two adapters is the common case, not a failure.
 MGMT="${VPNGW_MGMT:-$(physical_ifaces | grep -vx "$WAN" | grep -vx "$LAN" | head -1 || true)}"
 WAN_CIDR=$(ip -4 -o addr show dev "$WAN" 2>/dev/null | awk '{print $4; exit}' || true)
+# Management access is per interface, the way any router does it: the panel
+# and SSH answer on the LAN bridge (plus the management interface when one
+# exists). The uplink joins only when the operator says so - typically because
+# they administer the box from the network the uplink sits on, which is the
+# common two-adapter lab layout.
+ADMIN_WAN="${VPNGW_ADMIN_WAN:-}"
 if [[ -n "$MGMT" ]]; then
     ok "management interface: $MGMT"
-    ADMIN_CIDR="${VPNGW_ADMIN_CIDR:-}"
 else
-    ADMIN_CIDR="${VPNGW_ADMIN_CIDR:-$(python3 - "$WAN_CIDR" <<'PY'
-import ipaddress, sys
-try:
-    print(ipaddress.ip_interface(sys.argv[1]).network)
-except Exception:
-    print("")
-PY
-)}"
-    [[ -n "$ADMIN_CIDR" ]] || die \
-        "no third adapter for management and the uplink's subnet could not be
-       determined. Set VPNGW_ADMIN_CIDR to the network you administer from,
-       or applying the ruleset will lock you out of this machine."
-    warn "no spare adapter for a management segment."
-    warn "SSH and the web UI will be accepted on $WAN from $ADMIN_CIDR only."
-    warn "Narrow this with VPNGW_ADMIN_CIDR=<your.ip>/32 if you can."
+    warn "no spare adapter for a management segment; the panel answers on the"
+    warn "LAN bridge. If you administer from the uplink's network, answer yes"
+    warn "below (or set VPNGW_ADMIN_WAN=1)."
 fi
 
 LAN_CIDR="${VPNGW_LAN_CIDR:-10.10.0.1/24}"
@@ -150,13 +143,12 @@ EOF
     if [[ -n "$MGMT" ]]; then
         ask "Management interface (blank to use the uplink instead)" "$MGMT" MGMT
     fi
-    if [[ -z "$MGMT" ]]; then
-        echo "  No dedicated interface, so the panel is served on the uplink,"
-        echo "  restricted to one source range. Narrow this to your own address"
-        echo "  with /32 if you can."
-        ask "Admin source range" "$ADMIN_CIDR" ADMIN_CIDR
-        [[ -n "$ADMIN_CIDR" ]] || die "an admin range is required when there is no management interface"
-    fi
+    echo "  The panel and SSH answer on the LAN bridge${MGMT:+ and $MGMT}."
+    ask "Also answer on the uplink ($WAN)? [y/N]" "${ADMIN_WAN:+y}" ADMIN_WAN_ANSWER
+    case "${ADMIN_WAN_ANSWER,,}" in
+        y|yes|1) ADMIN_WAN=1 ;;
+        *)       ADMIN_WAN=  ;;
+    esac
 
     echo
     echo "  Clients normally live on the client interface alone, which is the"
@@ -192,7 +184,8 @@ PY
     echo "  Review:"
     printf "    %-22s %s\n" "uplink" "$WAN"
     printf "    %-22s %s -> br-lan %s\n" "client side" "$LAN" "$LAN_CIDR"
-    printf "    %-22s %s\n" "management" "${MGMT:-$WAN from $ADMIN_CIDR}"
+    printf "    %-22s %s
+" "management" "br-lan${MGMT:+, $MGMT}${ADMIN_WAN:+, $WAN}"
     printf "    %-22s %s\n" "clients on uplink too" "${SHARED:-no}"
     printf "    %-22s %s\n" "DHCP" "${WANT_DHCP:-no}"
     echo
@@ -314,7 +307,7 @@ mgmt_iface  = "${MGMT:-}"
 mgmt_cidr   = "10.20.0.1/24"
 # Management over the uplink, restricted to this source range. Empty when a
 # dedicated mgmt_iface exists.
-admin_cidr  = "${ADMIN_CIDR:-}"
+admin_ifaces = ["br-lan"${MGMT:+, \"$MGMT\"}${ADMIN_WAN:+, \"$WAN\"}]
 # Interfaces client traffic is accepted from. Empty means the client bridge
 # only - the layout where a client has no other way out. Listing the uplink
 # here supports clients that share its subnet; they are still confined to their
@@ -486,7 +479,7 @@ cat <<EOF
   Topology as installed:
     uplink        $WAN${WAN_CIDR:+  ($WAN_CIDR)}
     client side   $LAN  -> br-lan  $LAN_CIDR
-    management    ${MGMT:-$WAN, from $ADMIN_CIDR only}
+    management    br-lan${MGMT:+, $MGMT}${ADMIN_WAN:+, $WAN}
 
   Next:
     1. Start the daemon:      systemctl start vpngw
@@ -495,7 +488,7 @@ cat <<EOF
     4. Check it:              vpngwctl status
     5. Prove it:              vpngwctl selftest --disrupt
 
-  Web UI: http://${WAN_CIDR%%/*}:8080  (from $ADMIN_CIDR only)
+  Web UI: http://10.10.0.1:8080 (from the LAN)${ADMIN_WAN:+  or  http://${WAN_CIDR%%/*}:8080}
 
   Step 5 is the one that matters. Until it passes, treat this gateway as
   untested rather than leak-proof.

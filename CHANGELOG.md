@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.1.0
+
+Found by a user actually plugging a Windows client into the LAN side — which
+is the test no amount of self-testing replaces.
+
+- **The LAN bridge answers with the member NIC's MAC.** The kernel gives a new
+  bridge a random address, and under Hyper-V that is fatal invisibly: with MAC
+  spoofing off (the default), the virtual switch drops any frame whose source
+  MAC is not the one it assigned to the vNIC. Inbound still arrives, so the
+  gateway sees clients ARP for it — it just cannot answer. From the client
+  that reads as "destination host unreachable" to an address that is provably
+  up. The bridge MAC is now pinned to the member's, which also stops it
+  drifting when the leak test attaches its veth.
+- **Management access is per interface now, like a router.** `admin_cidr`
+  (source-range filtering on the uplink) is gone; the panel and SSH answer on
+  the interfaces listed in `admin_ifaces`, defaulting to the LAN bridge plus
+  the management interface. Ticking the uplink is an explicit choice in the
+  panel's Access control card. Old configs with `admin_cidr` still load.
+- **cli2mark no longer rewrites every five seconds.** Marks were written as
+  `0x0001` and read back from the kernel as `1`; the comparison saw a
+  difference on every pass and deleted + re-added the whole map, leaving
+  moments in which a client's packets carried no mark. Values are now compared
+  canonically.
+- **Client deletions are logged.** Two clients vanished with nothing in the
+  event log to say so; the silence cost an hour of suspecting database
+  corruption. Every removal now leaves a trace.
+- README gained rendered diagrams (Mermaid) of the packet path, the
+  kill-switch layers, DNS capture and pool failover.
+
 ## 1.0.0
 
 First release. Verified end to end on Debian 13 under Hyper-V, with a Windows

@@ -150,11 +150,10 @@ lan_member  = "lan0"      # physical NIC enslaved into the bridge
 lan_cidr    = "10.10.0.1/24"
 mgmt_iface  = "mgmt0"     # Internal switch, host <-> web UI only
 mgmt_cidr   = "10.20.0.1/24"
-# Only for gateways with no spare NIC for a management segment: accept SSH and
-# the web UI on the *uplink*, restricted to this source range. Leave empty when
-# mgmt_iface exists - a management plane on the uplink is reachable by whatever
-# else can reach the uplink.
-admin_cidr  = ""
+# Interfaces SSH and the web panel answer on. Empty = the LAN bridge plus
+# mgmt_iface, which is how a home router behaves: managed from inside, never
+# from the uplink unless you add it here yourself.
+admin_ifaces = []
 
 [dns]
 # Every client DNS query is DNAT-ed to a per-egress resolver on this subnet,
@@ -216,8 +215,8 @@ def render_toml(settings: "Settings") -> str:
             "# client_ifaces: which interfaces client traffic is accepted from.",
             "# Empty means just lan_bridge (isolated segment). Adding wan_iface",
             "# supports clients that share the uplink's subnet - see docs.",
-            "# admin_cidr: source range allowed to reach SSH and the UI over the",
-            "# uplink, for boxes with no spare adapter for management.",
+            "# admin_ifaces: interfaces SSH and the web panel answer on. Empty =",
+            "# the LAN bridge plus mgmt_iface (the router default).",
         ],
         "wan": ["# mode = \"dhcp\" or \"static\"."],
         "dhcp": [
@@ -254,16 +253,25 @@ class NetSettings:
     lan_cidr: str = "10.10.0.1/24"
     mgmt_iface: str = "mgmt0"
     mgmt_cidr: str = "10.20.0.1/24"
-    # Management over the uplink, for boxes that do not have a spare NIC for a
-    # dedicated management segment. When set, SSH and the web UI are accepted
-    # on the uplink *only* from this source range - everything else on that
-    # interface is still refused.
+    # Interfaces that may reach SSH and the web panel - the way a home router
+    # thinks about it: management is a property of which side of the box you
+    # are on, not of your source address. Source-range filtering (the old
+    # admin_cidr) looked stricter but broke the common case: an operator on
+    # the LAN side could not open the panel of their own gateway.
     #
-    # This exists because the alternative is worse, not because it is good: a
-    # management plane on the same interface as the uplink is reachable by
-    # whatever else can reach that interface. Prefer mgmt_iface when a third
-    # adapter is available.
-    admin_cidr: str = ""
+    # Empty means the LAN bridge plus mgmt_iface, which is the router default:
+    # manage it from inside, never from the internet side unless you name the
+    # uplink here explicitly.
+    admin_ifaces: tuple[str, ...] = ()
+
+    def management_ifaces(self) -> tuple[str, ...]:
+        """Where SSH and the panel answer, with the router default applied."""
+        if self.admin_ifaces:
+            return tuple(dict.fromkeys(self.admin_ifaces))
+        out = [self.lan_bridge]
+        if self.mgmt_iface:
+            out.append(self.mgmt_iface)
+        return tuple(out)
 
     # Which interfaces client traffic is accepted from. Empty means "the LAN
     # bridge", which is the isolated-segment design.
@@ -475,6 +483,12 @@ class Settings:
                 if isinstance(v, list):
                     data[k] = tuple(v)
             allowed = set(klass.__dataclass_fields__)
+            # admin_cidr was replaced by admin_ifaces. A config written before
+            # the rename must still boot the gateway - refusing to start over
+            # a removed option would take the panel down with it, and the
+            # panel is where the replacement is configured.
+            if section == "net" and "admin_cidr" in data:
+                data.pop("admin_cidr")
             unknown = set(data) - allowed
             if unknown:
                 raise ValueError(f"[{section}] unknown keys: {sorted(unknown)}")
@@ -527,25 +541,20 @@ class Settings:
         # the network - by design, nothing else is listening. Refuse to start
         # with no management path at all rather than discover it after the
         # ruleset loads.
-        if not self.net.mgmt_iface and not self.net.admin_cidr:
+        if not self.net.management_ifaces():
             problems.append(
-                "[net] no management path: set mgmt_iface (a dedicated "
-                "interface) or admin_cidr (a source range allowed to reach SSH "
-                "and the UI over the uplink). Without one, applying the ruleset "
-                "cuts off all administrative access to this machine."
+                "[net] no management path: admin_ifaces is empty and there is "
+                "no LAN bridge or mgmt_iface to fall back to. Applying the "
+                "ruleset would cut off all administrative access."
             )
-
-        if self.net.admin_cidr:
-            try:
-                admin = ipaddress.ip_network(self.net.admin_cidr, strict=False)
-            except ValueError as exc:
-                problems.append(f"[net] admin_cidr is not a valid network: {exc}")
-            else:
-                if admin.prefixlen == 0:
-                    problems.append(
-                        "[net] admin_cidr covers the whole internet; name the "
-                        "network you actually administer from"
-                    )
+        known = {self.net.wan_iface, self.net.lan_bridge, self.net.lan_member,
+                 self.net.mgmt_iface} - {""}
+        for iface in self.net.admin_ifaces:
+            if iface not in known:
+                problems.append(
+                    f"[net] admin_ifaces names {iface!r}, which is not one of "
+                    f"this gateway's interfaces ({', '.join(sorted(known))})"
+                )
 
         ifaces = [self.net.wan_iface, self.net.lan_bridge, self.net.lan_member]
         if self.net.mgmt_iface:

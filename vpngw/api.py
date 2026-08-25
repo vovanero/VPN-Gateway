@@ -384,7 +384,10 @@ def create_app(service) -> FastAPI:
     def delete_client(ip: str,
                       x_vpngw_token: str | None = Header(default=None)) -> dict:
         authorise(x_vpngw_token)
+        existing = db.client(ip)
         db.delete_client(ip)
+        if existing:
+            db.log_event("warning", ip, f"client {existing.name} removed")
         return touched()
 
     # -- operations --------------------------------------------------------

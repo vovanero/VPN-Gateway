@@ -104,31 +104,39 @@ class TestConfig(unittest.TestCase):
         with self.assertRaises(ValueError):
             settings.validate()
 
-    def test_a_config_with_no_management_path_is_refused(self):
-        # Applying the ruleset with nowhere to administer from is not
-        # recoverable over the network - nothing else is listening by design.
-        settings = config.Settings(
-            net=config.NetSettings(mgmt_iface="", admin_cidr=""))
+    def test_management_defaults_to_the_inside_interfaces(self):
+        # The router convention: managed from inside, never from the uplink
+        # unless the operator says so themselves.
+        net = config.NetSettings()
+        self.assertEqual(net.management_ifaces(), ("br-lan", "mgmt0"))
+        self.assertEqual(config.NetSettings(mgmt_iface="").management_ifaces(),
+                         ("br-lan",))
+
+    def test_explicit_admin_ifaces_override_the_default(self):
+        net = config.NetSettings(admin_ifaces=("br-lan", "wan0"))
+        self.assertEqual(net.management_ifaces(), ("br-lan", "wan0"))
+
+    def test_admin_ifaces_must_name_real_interfaces(self):
+        settings = config.Settings(net=config.NetSettings(
+            admin_ifaces=("br-lan", "eth7")))
         with self.assertRaises(ValueError) as cm:
             settings.validate()
-        self.assertIn("no management path", str(cm.exception))
+        self.assertIn("eth7", str(cm.exception))
 
-    def test_admin_cidr_alone_is_a_valid_management_path(self):
-        config.Settings(net=config.NetSettings(
-            mgmt_iface="", admin_cidr="192.168.1.0/24")).validate()
+    def test_an_old_config_with_admin_cidr_still_loads(self):
+        """The rename must not strand a gateway installed before it.
 
-    def test_admin_cidr_may_not_be_the_whole_internet(self):
-        settings = config.Settings(
-            net=config.NetSettings(mgmt_iface="", admin_cidr="0.0.0.0/0"))
-        with self.assertRaises(ValueError) as cm:
-            settings.validate()
-        self.assertIn("whole internet", str(cm.exception))
+        Refusing to start over a removed option would take the panel down
+        with it - and the panel is where the replacement is configured.
+        """
+        import tempfile
+        from pathlib import Path
 
-    def test_malformed_admin_cidr_is_refused(self):
-        settings = config.Settings(
-            net=config.NetSettings(mgmt_iface="", admin_cidr="not-a-network"))
-        with self.assertRaises(ValueError):
-            settings.validate()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vpngw.toml"
+            path.write_text('[net]\nadmin_cidr = "192.168.1.0/24"\n')
+            loaded = config.Settings.load(path)
+        self.assertEqual(loaded.net.management_ifaces(), ("br-lan", "mgmt0"))
 
     def test_resolver_ip_is_derived_and_unique(self):
         dns = config.DnsSettings()
@@ -410,31 +418,34 @@ class TestNftRender(unittest.TestCase):
         for rule in chain:
             self.assertNotIn("ip daddr", rule)
 
-    def test_management_over_uplink_is_restricted_to_the_admin_range(self):
+    def test_management_answers_on_exactly_the_admin_interfaces(self):
         settings = config.Settings(net=config.NetSettings(
-            mgmt_iface="", admin_cidr="100.200.50.0/24"))
+            mgmt_iface="", admin_ifaces=("br-lan", "wan0")))
         text = nftables.render(settings, self.tunnels, self.pools, [])
-        self.assertIn("define ADMIN_NET   = 100.200.50.0/24", text)
-        self.assertIn(
-            "iifname $WAN ip saddr $ADMIN_NET tcp dport { 22, 8080 } accept", text)
-        # $MGMT must not survive as a dangling reference - nft would reject it.
-        self.assertNotIn("$MGMT", text)
-        self.assertNotIn("define MGMT", text)
+        self.assertIn('iifname "br-lan" tcp dport { 22, 8080 } accept', text)
+        self.assertIn('iifname "wan0" tcp dport { 22, 8080 } accept', text)
+        # No source filtering: reachability is per interface, like a router.
+        self.assertNotIn("ADMIN_NET", text)
+
+    def test_the_uplink_answers_only_when_named_explicitly(self):
+        settings = config.Settings(net=config.NetSettings(mgmt_iface=""))
+        text = nftables.render(settings, self.tunnels, self.pools, [])
+        self.assertIn('iifname "br-lan" tcp dport { 22, 8080 } accept', text)
+        self.assertNotIn('iifname "wan0" tcp dport { 22, 8080 }', text)
 
     def test_boot_skeleton_keeps_the_same_door_open(self):
         # If the skeleton locked the operator out, a boot where vpngw fails to
         # start would leave a box nobody can log in to fix.
         settings = config.Settings(net=config.NetSettings(
-            mgmt_iface="", admin_cidr="100.200.50.0/24"))
+            mgmt_iface="", admin_ifaces=("br-lan", "wan0")))
         text = nftables.render_killswitch(settings)
-        self.assertIn(
-            'iifname "wan0" ip saddr 100.200.50.0/24 tcp dport { 22 } accept',
-            text)
+        self.assertIn('iifname "br-lan" tcp dport { 22 } accept', text)
+        self.assertIn('iifname "wan0" tcp dport { 22 } accept', text)
 
     def test_clients_can_never_reach_the_management_ports(self):
         for net in (config.NetSettings(),
-                    config.NetSettings(mgmt_iface="", admin_cidr="10.0.0.0/24")):
-            with self.subTest(mgmt=net.mgmt_iface or "admin_cidr"):
+                    config.NetSettings(mgmt_iface="")):
+            with self.subTest(mgmt=net.mgmt_iface or "lan-only"):
                 text = nftables.render(config.Settings(net=net),
                                        self.tunnels, self.pools, [])
                 chain, inside = [], False
@@ -460,7 +471,7 @@ class TestNftRender(unittest.TestCase):
         arrive still leaves only through a tunnel.
         """
         settings = config.Settings(net=config.NetSettings(
-            client_ifaces=("br-lan", "wan0"), admin_cidr="10.0.0.0/24"))
+            client_ifaces=("br-lan", "wan0")))
         text = nftables.render(settings, self.tunnels, self.pools, [])
         self.assertIn('elements = { "br-lan", "wan0" }', text)
 
