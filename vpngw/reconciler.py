@@ -145,6 +145,13 @@ class Reconciler:
                 self.settings.net.lan_bridge,
                 self.settings.net.mgmt_iface,
                 self.settings.net.lan_cidr,
+                # Access control is part of the ruleset, so changing it from
+                # the panel must rebuild the ruleset. Before these were here,
+                # unticking WAN said "saved" while the firewall kept answering
+                # on WAN until the next restart - a lie with a security shape.
+                self.settings.net.management_ifaces(),
+                tuple(self.settings.net.client_interfaces()),
+                tuple(self.settings.net.client_cidrs),
                 self.settings.dns.resolver_subnet,
                 self.settings.dns.block_dot,
                 self.settings.killswitch.strict_host_egress,

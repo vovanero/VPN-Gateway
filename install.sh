@@ -12,6 +12,10 @@
 #
 #   VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_WAN=1 ./install.sh
 #
+# The gateway keeps no history by default: journal silent, events off, DNS
+# queries never logged, HTTP access logging off. Logging is opt-in from the
+# panel (Settings -> Privacy & logging: none / normal / high).
+#
 set -euo pipefail
 
 PREFIX=/opt/vpngw

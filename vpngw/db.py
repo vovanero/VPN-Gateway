@@ -112,6 +112,10 @@ class Database:
             self.path, check_same_thread=False, isolation_level=None
         )
         self._conn.row_factory = sqlite3.Row
+        # Whether log_event records anything. Driven by [log] level: a
+        # privacy gateway's default is to keep no history at all, so the
+        # service flips this on only when the operator chose logging.
+        self.events_enabled = True
         with self._lock:
             self._conn.executescript(SCHEMA)
 
@@ -433,6 +437,8 @@ class Database:
     # -- events -------------------------------------------------------------
 
     def log_event(self, level: str, source: str, message: str) -> None:
+        if not self.events_enabled:
+            return
         self._x(
             "INSERT INTO event (ts, level, source, message) VALUES (?,?,?,?)",
             (time.time(), level, source, message),

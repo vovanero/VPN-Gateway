@@ -214,8 +214,43 @@ vpngwctl client assign 10.10.0.12 pool:eu
 
 ## The panel
 
-`http://10.20.0.1:8080` from the Windows host. The firewall accepts that port
-only on the management interface, so clients cannot reach it at all.
+`http://10.10.0.1:8080` — the gateway's LAN address, like any router. Which
+interfaces the panel and SSH answer on is itself a panel setting: tick boxes,
+apply, and the firewall rebuilds immediately, no restart.
+
+```mermaid
+flowchart LR
+    subgraph choices["Settings → Access control"]
+        LAN["☑ LAN br-lan
+default on"]
+        MGMT["☑ MGMT mgmt0
+when present"]
+        WAN["☐ WAN eth0
+off until you tick it"]
+    end
+    OP1["operator on the
+client network"] --> LAN --> P["web panel + SSH
+password on top"]
+    OP2["Hyper-V host on the
+management switch"] --> MGMT --> P
+    OP3["anything that can
+reach the uplink"] -.->|"only if ticked"| WAN -.-> P
+    C["client VMs' forwarded
+traffic"] --> KS["kill switch:
+tunnel or nothing
+— never the panel ports"]
+
+    style P fill:#1e3a8a,color:#fff
+    style KS fill:#7f1d1d,color:#fff
+    style WAN stroke-dasharray: 5 5
+```
+
+Management is per interface — a property of which side of the box you stand
+on, not of your source address. Unticking every box is refused: a fail-closed
+gateway with no management path is not "secure", it is a brick. Reaching the
+gateway's *own* addresses is governed by these boxes; reaching *through* it
+toward the uplink's network is forwarding, and the kill switch drops that
+regardless.
 
 | Page | What it is for |
 |---|---|
@@ -225,7 +260,7 @@ only on the management interface, so clients cannot reach it at all.
 | **Clients** | Assign a machine's exit from a dropdown, in place; multi-select for bulk reassignment |
 | **Security** | Run the leak test and read the result check by check; firewall counters with what each one means; the generated ruleset itself |
 | **Events** | Daemon events, filtered by level and text |
-| **Settings** | Interfaces, client network, uplink addressing, DHCP and the panel password — no file editing required |
+| **Settings** | Interfaces, client network, uplink addressing, DHCP, management access (which interfaces the panel answers on) and the panel password — no file editing required |
 
 Changing the uplink is the one setting that can end the session changing it,
 so it is applied the way network equipment has done it for decades: the new

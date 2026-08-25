@@ -1974,23 +1974,32 @@ function renderSettings(host) {
               + "the sign-in page to everything that can reach that "
               + "interface, so leave it off unless you administer from "
               + "there.")),
-          el("div", {}, ...n.all_interfaces.concat([net.lan_bridge])
-            .filter((v, i, a) => a.indexOf(v) === i)
-            .map((name) => {
-              const active = (net.admin_ifaces || []).length
-                ? net.admin_ifaces.includes(name)
-                : (name === net.lan_bridge || name === net.mgmt_iface);
-              return el("label", {
-                style: "display:flex;gap:8px;align-items:center;padding:4px 0;"
-                     + "font-size:13px;cursor:pointer" },
-                el("input", {
-                  type: "checkbox", name: "aif_" + name, style: "width:auto",
-                  checked: active,
-                }),
-                el("span", { class: "mono" }, name),
-                name === net.wan_iface
-                  ? el("span", { class: "mode-tag" }, "uplink") : null);
-            }))),
+          el("div", {}, ...[
+            // Role-first, because "open it on the LAN" is how an operator
+            // thinks; the interface name is the implementation detail.
+            { iface: net.lan_bridge, role: "LAN",
+              hint: "the client side — the normal place to manage from" },
+            { iface: net.wan_iface, role: "WAN",
+              hint: "the internet side — everything that can reach the "
+                  + "uplink can reach the sign-in page" },
+            ...(net.mgmt_iface ? [{ iface: net.mgmt_iface, role: "MGMT",
+              hint: "dedicated management adapter" }] : []),
+          ].map(({ iface, role, hint }) => {
+            const active = (net.admin_ifaces || []).length
+              ? net.admin_ifaces.includes(iface)
+              : (iface === net.lan_bridge || iface === net.mgmt_iface);
+            return el("label", {
+              style: "display:flex;gap:8px;align-items:center;padding:5px 0;"
+                   + "font-size:13px;cursor:pointer", title: hint },
+              el("input", {
+                type: "checkbox", name: "aif_" + iface, style: "width:auto",
+                checked: active,
+              }),
+              el("b", { style: "min-width:44px" }, role),
+              el("span", { class: "mono" }, iface),
+              role === "WAN"
+                ? el("span", { class: "mode-tag" }, "exposed") : null);
+          }))),
 
         el("div", { class: "setting-row" },
           el("div", {}, el("b", {}, "Accept clients from"),
@@ -2029,6 +2038,29 @@ function renderSettings(host) {
           "Revert"),
         el("button", { class: "btn primary", type: "submit", id: "applyBtn",
           disabled: true }, icon("check"), "Apply"))),
+
+    /* ── privacy & logging ─────────────────────────────────────────── */
+    el("div", { class: "section-title" }, "Privacy & logging"),
+    el("div", { class: "card" }, el("div", { class: "card-body" },
+      el("form", { id: "formLogging",
+                   onsubmit: (e) => { e.preventDefault(); saveLogging(); } },
+        settingRow("Logging",
+          "What the gateway records about its own operation. Client traffic — "
+          + "DNS queries, connections — is never logged at any level; this "
+          + "governs only operational records.",
+          el("select", { name: "log_level" },
+            el("option", { value: "none",
+                selected: (n.settings.log || {}).level === "none" },
+              "No logging — keep no history at all (default)"),
+            el("option", { value: "normal",
+                selected: (n.settings.log || {}).level === "normal" },
+              "Normal — warnings in the journal, events in the panel"),
+            el("option", { value: "high",
+                selected: (n.settings.log || {}).level === "high" },
+              "High — verbose journal, troubleshooting only"))),
+        el("div", { style: "display:flex;justify-content:flex-end;margin-top:10px" },
+          el("button", { class: "btn primary", type: "submit" },
+            icon("check"), "Apply"))))),
 
     /* ── password ──────────────────────────────────────────────────── */
     el("div", { class: "section-title" }, "Administrator password"),
@@ -2362,6 +2394,18 @@ function wanPendingBanner() {
                        "Uplink change kept");
           S.network = null; render();
         } }, icon("check"), "Keep this address")));
+}
+
+async function saveLogging() {
+  const level = $("#formLogging").log_level.value;
+  try {
+    await api("/api/network", "POST", { log: { level } });
+    toast("ok", "Logging set to " + level,
+          level === "none" ? "The gateway keeps no history from now on." : "");
+    S.network = null;
+  } catch (err) {
+    toast("err", "Rejected", err.message);
+  }
 }
 
 async function savePassword() {

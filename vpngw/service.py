@@ -31,20 +31,52 @@ log = logging.getLogger("vpngw")
 HISTORY_SAMPLES = 180
 
 
-def setup_logging(level: str = "INFO") -> None:
+def setup_logging(level: str | None = None) -> None:
+    """Quiet by default, on purpose.
+
+    At INFO the journal accumulates a history of the network: which machine
+    appeared when (discovery logs client IPs and MACs), every tunnel event,
+    every command run. On a privacy gateway with a persistent journal that is
+    surveillance of its own users, kept indefinitely, by default. WARNING
+    keeps what an operator needs when something is wrong - failures, config
+    changes, security-relevant transitions - and records nothing about who
+    was on the network while everything was fine.
+
+    Set VPNGW_LOG_LEVEL=info (or debug) while diagnosing; the Events page in
+    the panel still shows recent activity either way, from its own bounded
+    table.
+    """
+    import os
+
+    chosen = (level or os.environ.get("VPNGW_LOG_LEVEL") or "SILENT").upper()
     logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s %(levelname)-7s %(name)-16s %(message)s",
         datefmt="%H:%M:%S",
         stream=sys.stderr,
     )
-    logging.getLogger("vpngw.shell").setLevel(logging.INFO)
+    apply_log_level(chosen)
+
+
+#: The operator's words for it -> what the logging module does. "silent" is
+#: above CRITICAL so nothing at all is emitted.
+_LOG_LEVELS = {
+    "NONE": logging.CRITICAL + 10, "SILENT": logging.CRITICAL + 10,
+    "NORMAL": logging.WARNING, "WARNING": logging.WARNING,
+    "HIGH": logging.INFO, "INFO": logging.INFO, "DEBUG": logging.DEBUG,
+}
+
+
+def apply_log_level(name: str) -> None:
+    logging.getLogger().setLevel(
+        _LOG_LEVELS.get(name.upper(), logging.CRITICAL + 10))
 
 
 class Service:
     def __init__(self, settings: config.Settings | None = None) -> None:
         self.settings = settings or config.Settings.load()
         self.db = Database()
+        self.db.events_enabled = self.settings.log.level != "none"
+        apply_log_level(self.settings.log.level)
         self.reconciler = Reconciler(self.db, self.settings)
         self._wake = threading.Event()
         self._stop = threading.Event()
@@ -65,6 +97,10 @@ class Service:
         """
         self.settings = config.Settings.load()
         self.reconciler.settings = self.settings
+        # Both halves of the logging choice, applied immediately: the journal
+        # level, and whether the events table records anything new.
+        apply_log_level(self.settings.log.level)
+        self.db.events_enabled = self.settings.log.level != "none"
         log.info("settings reloaded from %s", config.CONFIG_FILE)
 
     # -- control ------------------------------------------------------------

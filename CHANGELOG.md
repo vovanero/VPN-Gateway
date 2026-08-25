@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.1.1
+
+- **No history by default.** A privacy gateway should hold no record of its
+  own network unless the operator turns recording on. The journal is silent,
+  the Events table stops filling, and both are controlled from the panel:
+  Settings → Privacy & logging, `none` (default) / `normal` / `high`. Client
+  traffic — DNS queries, connections — was never logged at any level and
+  still is not; this governs only the gateway's operational records.
+- **Access-control changes apply immediately.** Management interfaces,
+  client interfaces and client networks are now part of the ruleset
+  fingerprint, so unticking WAN in the panel rebuilds the firewall on the
+  spot instead of after the next restart — "saved" no longer means
+  "will be true later".
+- Management checkboxes are labelled by role (LAN / WAN / MGMT) with the
+  interface name alongside, and the WAN row is marked *exposed*.
+- README: a rendered diagram of per-interface management access.
+
 ## 1.1.0
 
 Found by a user actually plugging a Windows client into the LAN side — which

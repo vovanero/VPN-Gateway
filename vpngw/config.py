@@ -398,6 +398,23 @@ class HealthSettings:
 
 
 @dataclass(frozen=True)
+class LogSettings:
+    # What this gateway records about its own operation. The default is
+    # nothing: a privacy gateway should hold no history unless its operator
+    # deliberately turns history on. Client traffic - DNS queries,
+    # connections - is never logged at any level; these settings only govern
+    # the gateway's own operational records.
+    #
+    #   none    nothing at all: the journal stays silent and the panel's
+    #           Events page stops filling. The default.
+    #   normal  warnings and errors to the journal; control-plane events
+    #           (tunnel down, config changed, sign-ins) in a bounded table
+    #           for the Events page.
+    #   high    verbose journal, for troubleshooting only.
+    level: str = "none"
+
+
+@dataclass(frozen=True)
 class ApiSettings:
     bind: str = "10.20.0.1"
     port: int = 8080
@@ -417,6 +434,7 @@ class Settings:
     killswitch: KillswitchSettings = field(default_factory=KillswitchSettings)
     health: HealthSettings = field(default_factory=HealthSettings)
     api: ApiSettings = field(default_factory=ApiSettings)
+    log: LogSettings = field(default_factory=LogSettings)
 
     # -- serialisation ------------------------------------------------------
 
@@ -502,6 +520,7 @@ class Settings:
             killswitch=sub("killswitch", KillswitchSettings),
             health=sub("health", HealthSettings),
             api=sub("api", ApiSettings),
+            log=sub("log", LogSettings),
         )
         settings.validate()
         return settings
@@ -555,6 +574,11 @@ class Settings:
                     f"[net] admin_ifaces names {iface!r}, which is not one of "
                     f"this gateway's interfaces ({', '.join(sorted(known))})"
                 )
+
+        if self.log.level not in ("none", "normal", "high"):
+            problems.append(
+                f"[log] level must be none, normal or high, "
+                f"not {self.log.level!r}")
 
         ifaces = [self.net.wan_iface, self.net.lan_bridge, self.net.lan_member]
         if self.net.mgmt_iface:

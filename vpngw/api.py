@@ -445,7 +445,8 @@ def create_app(service) -> FastAPI:
 
         current = config.Settings.load()
         sections = {"net": config.NetSettings, "wan": config.WanSettings,
-                    "dhcp": config.DhcpSettings, "dns": config.DnsSettings}
+                    "dhcp": config.DhcpSettings, "dns": config.DnsSettings,
+                    "log": config.LogSettings}
         updates = {}
         for name, klass in sections.items():
             incoming = body.get(name)

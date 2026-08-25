@@ -242,6 +242,7 @@ class TestSettingsRoundTrip(unittest.TestCase):
         "NetSettings": {"lan_bridge": "br-test"},
         "WanSettings": {"mode": "static"},
         "DnsSettings": {"block_dot": True},
+        "LogSettings": {"level": "high"},
     }
 
     @classmethod
