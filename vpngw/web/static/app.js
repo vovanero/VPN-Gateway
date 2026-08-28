@@ -533,7 +533,7 @@ function renderTunnels(host) {
       el("button", { class: "btn primary", onclick: openTunnelDialog },
         icon("plus"), "Add tunnel")),
 
-    chainsSection(s),
+    chainsSection(s, q),
 
     !s.tunnels.length
       ? el("div", { class: "card" }, emptyState("tunnel", "No tunnels yet",
@@ -557,13 +557,20 @@ function renderTunnels(host) {
  * the whole feature exists to change.
  */
 
-function chainsSection(s) {
-  const chained = s.tunnels.filter((t) => t.via);
-  if (!chained.length) return null;
+function chainsSection(s, query = "") {
   const bySlug = Object.fromEntries(s.tunnels.map((t) => [t.slug, t]));
+  // The search box filters chains the way it filters the table: a chain
+  // matches when either of its hops does. With dozens of tunnels the
+  // section would otherwise stay full while the table empties.
+  const matches = (t) => !query ||
+    (t && (t.name.toLowerCase().includes(query) || t.slug.includes(query) ||
+           (t.exit_ip || "").includes(query)));
+  const chained = s.tunnels.filter((t) =>
+    t.via && (matches(t) || matches(bySlug[t.via])));
+  if (!chained.length) return null;
 
   return el("div", { style: "margin-bottom:18px" },
-    el("div", { class: "section-title" }, "Double VPN"),
+    el("div", { class: "section-title" }, `Double VPN · ${chained.length}`),
     ...chained.map((exit) => {
       const entry = bySlug[exit.via];
       return el("div", { class: "card chain-card" },
@@ -637,12 +644,20 @@ function openChainDialog() {
     : riders.has(t.slug) ? `already the entry for ${carried[t.slug]}`
     : "";
 
-  const pick = (name, blockedFn) => el("select", { name, class: "grow" },
-    ...s.tunnels.map((t) => {
-      const why = blockedFn(t);
-      return el("option", { value: t.slug, disabled: !!why },
-        `${t.name} (${t.slug})${why ? " — " + why : ""}`);
-    }));
+  // Usable tunnels first, alphabetically; occupied ones sink to the
+  // bottom. With a handful this is cosmetic - with fifty it is the
+  // difference between picking and hunting, and the browser's own
+  // type-ahead works on whatever is sorted sensibly.
+  const pick = (name, blockedFn) => {
+    const ordered = [...s.tunnels].sort((a, b) =>
+      (!!blockedFn(a) - !!blockedFn(b)) || a.name.localeCompare(b.name));
+    return el("select", { name, class: "grow" },
+      ...ordered.map((t) => {
+        const why = blockedFn(t);
+        return el("option", { value: t.slug, disabled: !!why },
+          `${t.name} (${t.slug})${why ? " — " + why : ""}`);
+      }));
+  };
   const entrySel = pick("entry", entryBlocked);
   const exitSel = pick("exit", exitBlocked);
 
@@ -1683,6 +1698,43 @@ function closeDrawer() {
   $("#drawerBackdrop").classList.add("hidden");
 }
 
+/** Rename in place. The name is what every chain, pool, dropdown and
+ *  event shows, so this is also how a double VPN gets a meaningful name -
+ *  the chain displays as "<exit tunnel name> - double VPN via <entry>",
+ *  and the exit tunnel's name is this one. One name, one owner.
+ */
+function renameTunnel(t) {
+  const title = $("#drawerTitle");
+  const input = el("input", { value: t.name, maxlength: 60,
+                              style: "font:inherit;width:100%" });
+  title.replaceChildren(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const finish = async (save) => {
+    if (done) return;
+    done = true;
+    const wanted = input.value.trim();
+    if (save && wanted && wanted !== t.name) {
+      try {
+        await api(`/api/tunnels/${t.slug}`, "PATCH", { name: wanted });
+        toast("ok", "Renamed", `${t.name} is now ${wanted}`);
+        await refresh();
+      } catch (err) {
+        toast("err", "Rename failed", err.message);
+      }
+    }
+    renderDrawer();
+    render();
+  };
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") finish(true);
+    if (ev.key === "Escape") finish(false);
+  });
+  input.addEventListener("blur", () => finish(true));
+}
+
 function renderDrawer() {
   if (!S.drawerSlug || !S.snap) return;
   const t = S.snap.tunnels.find((x) => x.slug === S.drawerSlug);
@@ -1691,7 +1743,8 @@ function renderDrawer() {
   $("#drawer").classList.remove("hidden");
   $("#drawerBackdrop").classList.remove("hidden");
   $("#drawerTitle").textContent = t.name;
-  $("#drawerSub").textContent = `${t.iface} · tablo ${t.table} · mark ${t.mark}`;
+  $("#drawerSub").textContent = `${t.iface} · table ${t.table} · mark ${t.mark}`
+    + (t.via ? ` · double VPN via ${t.via}` : "");
 
   const rttSeries = t.history.map((h) => h.rtt || 0);
   const body = $("#drawerBody");
@@ -1702,6 +1755,8 @@ function renderDrawer() {
       t.routed ? pill("neutral", "routed")
                : pill("unknown", "no route"),
       el("span", { class: "spacer" }),
+      el("button", { class: "btn sm", onclick: () => renameTunnel(t) },
+        "Rename"),
       el("button", { class: "btn sm", onclick: () => toggleTunnel(t) },
         icon("power"), t.enabled ? "Disable" : "Enable")),
 
