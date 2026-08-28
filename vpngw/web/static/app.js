@@ -895,7 +895,7 @@ function renderClients(host) {
 
   add(host, [
     el("div", { class: "row wrap", style: "margin-bottom:16px" },
-      searchBox("clients", "Ad veya IP ara…"),
+      searchBox("clients", "Search name or IP…"),
       anySelected && el("span", { class: "pill accent" },
         `${S.selection.size} selected`),
       anySelected && el("select", {
