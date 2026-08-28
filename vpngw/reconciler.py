@@ -33,9 +33,9 @@ from . import config, dnsmgr
 from .db import Database
 from .discovery import Discovery
 from .health import HealthMonitor
-from .models import Egress, EgressKind, HealthState, Pool, Tunnel
+from .models import Egress, EgressKind, HealthState, Pool, Tunnel, TunnelKind
 from .net import ifaces, nft, routing
-from .net.shell import missing_binaries
+from .net.shell import missing_binaries, try_run
 from .pools import PoolManager
 from .render import nftables as render_nft
 from .tunnels import driver_for
@@ -58,6 +58,12 @@ class Reconciler:
         self._last_pass: float = 0.0
         self._endpoint_refreshed: float = 0.0
         self._api_endpoints: list[str] = []
+        #: via as last actually applied to the device, per slug. Seeded from
+        #: the kernel (wg's own fwmark) rather than the database, because a
+        #: CLI edit made while the daemon was down leaves the database ahead
+        #: of the device - trusting the database would skip the very re-apply
+        #: that closes that gap.
+        self._applied_via: dict[str, str] = {}
         # Tunnels the reconcile loop must leave alone. Used by the leak test:
         # without it, taking a tunnel down and measuring the result is a race
         # the loop wins - it restores the tunnel within its five-second timer
@@ -108,7 +114,7 @@ class Reconciler:
         egresses = self._egresses(tunnels, pools)
 
         self._step_firewall(tunnels, pools, clients, force=force_structural)
-        self._step_routes(egresses)
+        self._step_routes(egresses, tunnels)
         self._step_tunnels(tunnels)
         self._step_health(tunnels)
         self._step_steer_tunnels(tunnels)
@@ -137,7 +143,8 @@ class Reconciler:
         that evidence away.
         """
         payload = {
-            "tunnels": sorted((t.slug, t.iface, t.enabled) for t in tunnels),
+            "tunnels": sorted((t.slug, t.iface, t.enabled, t.via)
+                              for t in tunnels),
             "pools": sorted((p.slug, p.esid, p.enabled) for p in pools),
             "maintenance": self.maintenance_active(),
             "settings": [
@@ -211,9 +218,14 @@ class Reconciler:
         nft.sync_map("cli2mark", cli2mark)
         nft.sync_map("cli2dns", cli2dns)
         nft.sync_set("tun_ifaces", {f'"{t.iface}"' for t in enabled_tunnels})
+        # Only tunnels that legitimately dial out over the WAN. A chained
+        # tunnel's endpoint is deliberately absent: its handshake leaves
+        # through the parent (@tun_ifaces is already accepted), and keeping
+        # the address off this set means a routing mistake ends in a drop on
+        # the uplink, not in the ISP watching us greet the exit provider.
         nft.sync_set(
             "vpn_endpoints",
-            {ep for t in enabled_tunnels for ep in t.endpoints},
+            {ep for t in enabled_tunnels if not t.via for ep in t.endpoints},
         )
         nft.sync_set("provider_api", set(self._api_endpoints))
 
@@ -224,11 +236,16 @@ class Reconciler:
         out += [Egress.of(p) for p in pools if p.enabled]
         return out
 
-    def _step_routes(self, egresses: list[Egress]) -> None:
+    def _step_routes(self, egresses: list[Egress],
+                     tunnels: list[Tunnel]) -> None:
         for eg in egresses:
             routing.ensure_blackhole(eg.table)
+        by_slug = {t.slug: t for t in tunnels if t.enabled}
+        chained = [(t, by_slug[t.via]) for t in by_slug.values()
+                   if t.via and t.via in by_slug]
         routing.sync_rules(
-            routing.desired_rules(egresses, self.settings.dns.resolver_ip)
+            routing.desired_rules(egresses, self.settings.dns.resolver_ip,
+                                  chained)
         )
 
     # -- 3. tunnels ---------------------------------------------------------
@@ -257,9 +274,66 @@ class Reconciler:
             except Exception:
                 log.exception("could not restore tunnels after a hold")
 
+    def _chain_mtu(self, t: Tunnel, by_slug: dict[str, Tunnel]) -> int:
+        """The MTU a chained tunnel gets when the operator has not set one.
+
+        Each layer of encapsulation costs CHAIN_MTU_OVERHEAD; ignoring that
+        is the classic double-VPN failure - handshake fine, DNS fine, HTTPS
+        hangs - because full-size packets silently vanish inside the outer
+        tunnel. Walks to the WAN and subtracts per hop.
+        """
+        depth, seen = 0, set()
+        current = t
+        while current.via and current.slug not in seen:
+            seen.add(current.slug)
+            depth += 1
+            parent = by_slug.get(current.via)
+            if parent is None:
+                break
+            current = parent
+        base = current.mtu or 1420
+        return max(1280, base - config.CHAIN_MTU_OVERHEAD * depth)
+
+    def _via_needs_reapply(self, t: Tunnel) -> bool:
+        if t.slug not in self._applied_via:
+            # First sight of an interface this process did not bring up. Ask
+            # the device what it actually carries where we can (WireGuard
+            # reports its fwmark); OpenVPN cannot be asked, so trust the
+            # database and accept that a daemon-down CLI edit needs the next
+            # via change (or a restart) to land.
+            if t.kind is TunnelKind.WIREGUARD:
+                res = try_run(["wg", "show", t.iface, "fwmark"])
+                raw = (res.stdout or "").strip()
+                actual = 0 if raw in ("off", "") else int(raw, 16)
+                wanted = t.outer_mark if t.via else 0
+                self._applied_via[t.slug] = t.via if actual == wanted else "\0"
+            else:
+                self._applied_via[t.slug] = t.via
+        return self._applied_via[t.slug] != t.via
+
     def _step_tunnels(self, tunnels: list[Tunnel]) -> None:
+        # Parents before children: a chained tunnel's first handshake needs
+        # the parent's interface (and its route) to exist. Depth 0 first.
+        by_slug = {t.slug: t for t in tunnels}
+
+        def depth(t: Tunnel) -> int:
+            d, cur, seen = 0, t, set()
+            while cur.via and cur.slug not in seen:
+                seen.add(cur.slug)
+                nxt = by_slug.get(cur.via)
+                if nxt is None:
+                    break
+                cur = nxt
+                d += 1
+            return d
+
+        tunnels = sorted(tunnels, key=depth)
         expected: set[str] = set()
         for t in tunnels:
+            if t.via and not t.mtu:
+                # In-memory only: mtu=0 stays on disk meaning "derive it",
+                # so re-parenting the chain re-derives automatically.
+                t.mtu = self._chain_mtu(t, by_slug)
             driver = driver_for(t)
             if t.slug in self._held:
                 # Held down deliberately; keep the interface name reserved so
@@ -271,10 +345,32 @@ class Reconciler:
                 if not ifaces.exists(t.iface):
                     try:
                         self._link_info[t.slug] = driver.up(t)
+                        self._applied_via[t.slug] = t.via
                         self.db.log_event("info", t.slug, "tunnel brought up")
                     except Exception as exc:
                         log.error("cannot bring up %s: %s", t.slug, exc)
                         self.db.log_event("error", t.slug, f"up failed: {exc}")
+                elif ifaces.mtu_of(t.iface) not in (0, t.mtu or None) and t.mtu:
+                    # An MTU edit alone must not wait for the next re-up: on a
+                    # chain it is the difference between working and "DNS fine,
+                    # HTTPS hangs". Setting it live costs no handshake.
+                    routing.set_link_mtu(t.iface, t.mtu)
+                    self.db.log_event("info", t.slug, f"mtu set to {t.mtu}")
+                elif self._via_needs_reapply(t):
+                    # Chaining changed under a live interface. Re-running the
+                    # driver replaces the device config - including the outer
+                    # fwmark, which is the part that makes the chain real.
+                    try:
+                        self._link_info[t.slug] = driver.up(t)
+                        self._applied_via[t.slug] = t.via
+                        self.db.log_event(
+                            "info", t.slug,
+                            f"now routed via {t.via}" if t.via
+                            else "unchained; leaves over the WAN again")
+                    except Exception as exc:
+                        log.error("cannot re-apply %s: %s", t.slug, exc)
+                        self.db.log_event("error", t.slug,
+                                          f"re-apply failed: {exc}")
             else:
                 if ifaces.exists(t.iface):
                     driver.down(t)
@@ -314,7 +410,32 @@ class Reconciler:
             self._link_info[t.slug] = info
         return info
 
+    def _ancestors_usable(self, t: Tunnel,
+                          by_slug: dict[str, Tunnel]) -> bool:
+        """False when anything this tunnel rides through cannot carry it.
+
+        Without this, a dead entry hop leaves the exit hop looking healthy
+        for up to handshake_max_age - and its clients pointlessly routed at
+        a tunnel whose packets are falling into the parent's blackhole.
+        The blackhole keeps them safe either way; this makes the panel and
+        the failover tell the truth *now*.
+        """
+        seen = set()
+        current = t
+        while current.via and current.slug not in seen:
+            seen.add(current.slug)
+            parent = by_slug.get(current.via)
+            if parent is None or not parent.enabled:
+                return False
+            state = self.health.get(parent.slug).state
+            if not ifaces.exists(parent.iface) or state in (
+                    HealthState.DOWN, HealthState.DISABLED):
+                return False
+            current = parent
+        return True
+
     def _step_steer_tunnels(self, tunnels: list[Tunnel]) -> None:
+        by_slug = {t.slug: t for t in tunnels}
         for t in tunnels:
             if t.slug in self._held:
                 continue
@@ -328,6 +449,7 @@ class Reconciler:
                 ifaces.exists(t.iface)
                 and health.state is not HealthState.DOWN
                 and health.state is not HealthState.DISABLED
+                and self._ancestors_usable(t, by_slug)
             )
             if usable:
                 current = routing.table_default(t.table)

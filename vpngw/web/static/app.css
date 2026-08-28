@@ -540,6 +540,37 @@ input:user-invalid, select:user-invalid { border-color: var(--danger); }
   border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
 }
 
+/* ── double VPN chains ─────────────────────────────────────────────────
+ *
+ * Drawn as a path because that is what a chain is. Hop state reuses the
+ * same three colours as everything else: green flows, red blocked, amber
+ * undecided.
+ */
+.chain-card { margin-bottom: 10px; }
+.chain-strip {
+  display: flex; align-items: center; gap: 10px;
+  padding: 16px; overflow-x: auto;
+}
+.chain-hop {
+  flex: 1; min-width: 130px; text-align: center;
+  padding: 10px 12px; border-radius: var(--r);
+  border: 1px solid var(--border-2); background: var(--surface-2);
+}
+.chain-hop.up       { border-color: color-mix(in srgb, var(--ok) 45%, var(--border-2)); }
+.chain-hop.down,
+.chain-hop.bad      { border-color: var(--danger); background: var(--danger-soft); }
+.chain-hop.disabled { opacity: .6; }
+.chain-hop select   { margin-top: 6px; width: 100%; }
+.chain-arrow { color: var(--text-3); font-size: 18px; flex: none; }
+.chain-end {
+  flex: none; text-align: center; min-width: 84px;
+  color: var(--text-2);
+}
+.chain-end-label {
+  font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--text-3); margin-bottom: 2px;
+}
+
 /* Sticky, because the form is long and the button that commits it should not
    be something you have to scroll to find. */
 .apply-bar {

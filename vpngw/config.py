@@ -55,6 +55,25 @@ TUNNEL_ESID_MIN, TUNNEL_ESID_MAX = 1, 999
 POOL_ESID_MIN, POOL_ESID_MAX = 1000, 1999
 TABLE_BASE = 100
 
+# Chained tunnels (v2). A chained tunnel's *encrypted* packets carry
+# OUTER_MARK_BASE | esid - bit 16, deliberately outside the client esid
+# space above - and one ip rule per chained tunnel sends them into the
+# parent's routing table. Matched with OUTER_MARK_MASK so the rule fires
+# only for outer packets, never for client traffic.
+OUTER_MARK_BASE = 0x10000
+OUTER_MARK_MASK = 0x1FFFF
+RULE_PRIO_OUTER = 850      # after LOCAL (800), before every client rule
+#: Double VPN: entry + exit, and that is the product. Each extra hop
+#: costs 60-80 bytes of MTU, its own latency, and roughly half the
+#: remaining throughput - and the privacy argument (no single provider
+#: sees both ends) is already complete at two. The mechanism underneath
+#: is depth-agnostic, so raising this later is changing one number.
+MAX_CHAIN_HOPS = 2
+#: What one WireGuard encapsulation costs (worst case, v4): 20 IP + 8 UDP
+#: + 32 WG, rounded up for safety. A chained tunnel with mtu=0 gets
+#: parent_mtu minus this.
+CHAIN_MTU_OVERHEAD = 80
+
 # ip rule priorities. Lower number = evaluated first.
 #
 # RULE_PRIO_LOCAL is consulted before anything else and exists to keep locally

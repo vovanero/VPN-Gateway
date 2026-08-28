@@ -84,6 +84,7 @@ def render(
     auth_file: str | None = None,
     updown_script: str = "/usr/libexec/vpngw/ovpn-updown.sh",
     mtu: int = 0,
+    fwmark: int = 0,
     verb: int = 3,
 ) -> tuple[str, list[str]]:
     body, removed = strip_provider_config(provider_config)
@@ -129,6 +130,11 @@ def render(
     ]
     if mtu:
         ours.append(f"tun-mtu {mtu}")
+    if fwmark:
+        # SO_MARK on the transport socket - the OpenVPN spelling of
+        # WireGuard's FwMark. What sends a chained tunnel's encrypted
+        # traffic into its parent instead of out the WAN.
+        ours.append(f"mark {fwmark}")
     if auth_file:
         ours.append(f"auth-user-pass {auth_file}")
         ours.append("auth-nocache")

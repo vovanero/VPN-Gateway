@@ -49,6 +49,12 @@ class WireGuardDriver(TunnelDriver):
         lines = ["[Interface]", f"PrivateKey = {spec['private_key']}"]
         if spec.get("listen_port"):
             lines.append(f"ListenPort = {spec['listen_port']}")
+        # Chained: this tunnel's own encrypted packets carry a mark that an
+        # ip rule sends into the parent's routing table. setconf replaces
+        # the whole device config, so omitting the line on an unchained
+        # tunnel also *clears* a stale mark from an earlier chaining.
+        if t.via:
+            lines.append(f"FwMark = {t.outer_mark:#x}")
         for peer in spec.get("peers", []):
             lines.append("")
             lines.append("[Peer]")

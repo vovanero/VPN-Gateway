@@ -66,6 +66,7 @@ class OpenVpnDriver(TunnelDriver):
             iface=t.iface,
             auth_file=str(auth) if auth.exists() else None,
             mtu=t.mtu,
+            fwmark=t.outer_mark if t.via else 0,
         )
         if removed:
             log.info("%s: neutralised %d provider directives (%s)", t.slug,

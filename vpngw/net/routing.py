@@ -34,6 +34,10 @@ log = logging.getLogger("vpngw.routing")
 # ---------------------------------------------------------------------------
 
 
+def set_link_mtu(iface: str, mtu: int) -> None:
+    try_run(["ip", "link", "set", "mtu", str(mtu), "dev", iface])
+
+
 def ensure_blackhole(table: int) -> None:
     """Install the fallback discard route. Safe to call repeatedly."""
     run(
@@ -110,12 +114,19 @@ def _rules() -> list[dict]:
         return []
 
 
-def desired_rules(egresses, resolver_ip_for) -> list[list[str]]:
+def desired_rules(egresses, resolver_ip_for,
+                  chained: list | None = None) -> list[list[str]]:
     """Build the full set of ip-rule argument lists we want to exist.
 
     Two rules per egress:
       * one selecting the table by fwmark  (forwarded client traffic)
       * one selecting it by source address (that egress's DNS resolver)
+
+    Plus one per *chained* tunnel: its own encrypted packets carry
+    OUTER_MARK_BASE|esid, and this rule sends them into the parent's table
+    instead of letting them fall through to the WAN. Priority 850 - before
+    every client rule, which matters: an outer mark's low bits are an esid,
+    so a client rule's /0xffff match would happily claim it.
     """
     # Consulted first: locally connected destinations resolve from the main
     # table, and only traffic with nowhere local to go falls through to a
@@ -128,6 +139,16 @@ def desired_rules(egresses, resolver_ip_for) -> list[list[str]]:
             "priority", str(config.RULE_PRIO_LOCAL),
         ]
     ]
+    for tunnel, parent in (chained or []):
+        out.append(
+            [
+                "from", "all",
+                "fwmark",
+                f"{tunnel.outer_mark:#x}/{config.OUTER_MARK_MASK:#x}",
+                "lookup", str(parent.table),
+                "priority", str(config.RULE_PRIO_OUTER),
+            ]
+        )
     for eg in egresses:
         out.append(
             [

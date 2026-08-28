@@ -89,11 +89,20 @@ class Tunnel:
     # allowlist; without it a strict ruleset would block the handshake itself.
     endpoints: list[str] = field(default_factory=list)
     endpoint_hosts: list[str] = field(default_factory=list)
+    # Chaining. Empty = this tunnel's encrypted packets leave over the WAN,
+    # as every tunnel did before v2. A slug = they leave through that tunnel
+    # instead, making this the inner hop of a chain. Everything else about
+    # the tunnel - esid, table, resolver, clients, pool membership - is
+    # untouched by chaining; only where the *outside* goes changes.
+    via: str = ""
     notes: str = ""
     id: int | None = None
 
     def __post_init__(self) -> None:
         self.slug = validate_slug(self.slug)
+        self.via = normalise_slug(self.via) if self.via else ""
+        if self.via == self.slug:
+            raise ValidationError(f"{self.slug!r} cannot route through itself")
         if not isinstance(self.kind, TunnelKind):
             self.kind = TunnelKind(self.kind)
         if self.esid != ESID_UNALLOCATED and not (
@@ -117,6 +126,16 @@ class Tunnel:
     @property
     def mark(self) -> int:
         return self.esid
+
+    @property
+    def outer_mark(self) -> int:
+        """The mark this tunnel's own encrypted packets carry when chained.
+
+        Disjoint from the client esid space (low 16 bits) by construction:
+        bit 16 is always set, so no outer mark can ever satisfy a client
+        rule's `/0xffff` match before its own rule has had the chance to.
+        """
+        return config.OUTER_MARK_BASE | self.esid
 
 
 @dataclass

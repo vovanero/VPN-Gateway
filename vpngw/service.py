@@ -225,6 +225,7 @@ class Service:
                 "table": t.table,
                 "mark": t.mark,
                 "state": h.state.value,
+                "via": t.via,
                 "rtt_ms": h.rtt_ms,
                 "exit_ip": h.exit_ip,
                 "up_since": h.up_since,

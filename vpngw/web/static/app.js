@@ -528,8 +528,12 @@ function renderTunnels(host) {
     el("div", { class: "row wrap", style: "margin-bottom:16px" },
       searchBox("tunnels", "Search tunnels…"),
       el("span", { class: "spacer" }),
+      el("button", { class: "btn", onclick: openChainDialog },
+        icon("link"), "New double VPN"),
       el("button", { class: "btn primary", onclick: openTunnelDialog },
         icon("plus"), "Add tunnel")),
+
+    chainsSection(s),
 
     !s.tunnels.length
       ? el("div", { class: "card" }, emptyState("tunnel", "No tunnels yet",
@@ -545,13 +549,152 @@ function renderTunnels(host) {
   ]);
 }
 
+/* ── double VPN chains ─────────────────────────────────────────────────────
+ *
+ * A chain is drawn as the thing it is: a path. Every hop is a node with its
+ * own live health, because "the chain is down" is useless next to "the entry
+ * hop is down". The exit node carries the measured exit address - the number
+ * the whole feature exists to change.
+ */
+
+function chainsSection(s) {
+  const chained = s.tunnels.filter((t) => t.via);
+  if (!chained.length) return null;
+  const bySlug = Object.fromEntries(s.tunnels.map((t) => [t.slug, t]));
+
+  return el("div", { style: "margin-bottom:18px" },
+    el("div", { class: "section-title" }, "Double VPN"),
+    ...chained.map((exit) => {
+      const entry = bySlug[exit.via];
+      return el("div", { class: "card chain-card" },
+        el("div", { class: "chain-strip" },
+          el("div", { class: "chain-end" },
+            el("div", { class: "chain-end-label" }, "ISP sees"),
+            el("div", { class: "mono", style: "font-size:12px" },
+              entry ? (entry.endpoints[0] || entry.name) : "?")),
+          chainArrow(),
+          chainHop(entry, "entry"),
+          chainArrow(),
+          chainHop(exit, "exit"),
+          chainArrow(),
+          el("div", { class: "chain-end" },
+            el("div", { class: "chain-end-label" }, "internet sees"),
+            el("div", { class: "mono", style: "font-size:12px" },
+              exit.exit_ip || "—"))),
+        el("div", { class: "row", style: "padding:0 16px 12px;gap:14px" },
+          el("span", { class: "sub" },
+            `end to end ${exit.rtt_ms ? Math.round(exit.rtt_ms) + " ms" : "—"}`
+            + ` · mtu ${exit.mtu || "auto"}`),
+          el("span", { class: "spacer" }),
+          el("button", { class: "btn sm", onclick: () => unchain(exit.slug) },
+            "Unchain")));
+    }));
+}
+
+function chainHop(t, role) {
+  if (!t) return el("div", { class: "chain-hop bad" },
+    el("b", {}, "missing"), el("div", { class: "sub" }, role));
+  const state = t.enabled ? t.state : "disabled";
+  return el("div", { class: "chain-hop " + state },
+    el("div", { class: "row", style: "gap:7px;justify-content:center" },
+      pill(state), el("b", {}, t.name)),
+    el("div", { class: "sub", style: "margin-top:2px" },
+      `${role} · ${t.rtt_ms ? Math.round(t.rtt_ms) + " ms" : "—"}`));
+}
+
+function chainArrow() {
+  return el("div", { class: "chain-arrow", "aria-hidden": "true" }, "→");
+}
+
+function unchain(slug) {
+  confirmDialog("Dissolve this double VPN?",
+    "The tunnel goes back to leaving over the WAN directly. Clients "
+    + "assigned to it keep working - with one hop instead of two.",
+    "Unchain")
+    .then((ok) => ok && mutate(
+      () => api(`/api/tunnels/${slug}`, "PATCH", { via: "" }),
+      "Chain dissolved"));
+}
+
+function openChainDialog() {
+  const s = S.snap;
+  const riders = new Set(s.tunnels.filter((t) => t.via).map((t) => t.via));
+  // Entry: anything unchained. Exit: unchained AND not already carrying
+  // someone (the ceiling is two hops, so a carrier cannot also be an exit).
+  const entries = s.tunnels.filter((t) => !t.via);
+  const exits = s.tunnels.filter((t) => !t.via && !riders.has(t.slug));
+
+  if (s.tunnels.length < 2 || !entries.length || !exits.length) {
+    toast("warn", "Two tunnels needed",
+          "A double VPN is one tunnel routed through another - import a "
+          + "second tunnel first.");
+    return;
+  }
+
+  const pick = (name, list) => el("select", { name, class: "grow" },
+    ...list.map((t) => el("option", { value: t.slug },
+      `${t.name} (${t.slug})`)));
+  const entrySel = pick("entry", entries);
+  const exitSel = pick("exit", exits);
+
+  const dlg = $("#dlgChain");
+  const host = $("#chainBuilder");
+  host.replaceChildren(
+    el("div", { class: "chain-strip", style: "margin-bottom:14px" },
+      el("div", { class: "chain-end" },
+        el("div", { class: "chain-end-label" }, "you")),
+      chainArrow(),
+      el("div", { class: "chain-hop unknown" },
+        el("div", { class: "sub" }, "entry — ISP sees this"), entrySel),
+      chainArrow(),
+      el("div", { class: "chain-hop unknown" },
+        el("div", { class: "sub" }, "exit — internet sees this"), exitSel),
+      chainArrow(),
+      el("div", { class: "chain-end" },
+        el("div", { class: "chain-end-label" }, "internet"))),
+    el("p", { class: "sub", style: "line-height:1.5" },
+      "The exit tunnel's encrypted traffic is routed through the entry "
+      + "instead of the uplink. Assign clients to the exit tunnel to use "
+      + "the chain. Two different providers make the strongest pair: "
+      + "neither one sees both who you are and where you go."));
+
+  // Picking the same tunnel twice is nonsense the server would reject;
+  // nicer to make it unpickable here.
+  const sync = () => {
+    for (const opt of exitSel.options)
+      opt.disabled = opt.value === entrySel.value;
+    if (exitSel.value === entrySel.value) {
+      const free = [...exitSel.options].find((o) => !o.disabled);
+      if (free) exitSel.value = free.value;
+    }
+  };
+  entrySel.addEventListener("change", sync);
+  sync();
+  dlg.showModal();
+
+  $("#formChain").onsubmit = async (ev) => {
+    ev.preventDefault();
+    try {
+      await api(`/api/tunnels/${exitSel.value}`, "PATCH",
+                { via: entrySel.value });
+      dlg.close();
+      toast("ok", "Double VPN created",
+            `${exitSel.value} now leaves through ${entrySel.value}.`);
+      await refresh();
+    } catch (err) {
+      toast("err", "Rejected", err.message);
+    }
+  };
+}
+
 function tunnelRow(t) {
   const state = t.enabled ? t.state : "disabled";
   const users = t.direct_clients + t.pool_clients;
   return el("tr", {},
     el("td", { class: "name" },
       el("button", { class: "linkish", onclick: () => openDrawer(t.slug) }, t.name),
-      el("div", { class: "sub mono" }, `${t.kind} · ${t.iface}`)),
+      el("div", { class: "sub mono" }, `${t.kind} · ${t.iface}`
+        + (t.via ? ` · via ${t.via}` : ""))),
     el("td", { class: "tight" }, pill(state),
       t.enabled && t.state === "down" && t.last_error
         ? el("div", { class: "sub wrap" }, t.last_error) : null),
@@ -797,7 +940,8 @@ function egressOptions(selected) {
     for (const t of S.snap.tunnels)
       g.append(el("option", { value: "tunnel:" + t.slug,
         selected: selected === "tunnel:" + t.slug },
-        `${t.name}${t.enabled ? "" : " (disabled)"}`));
+        `${t.name}${t.via ? " — double VPN via " + t.via : ""}`
+        + `${t.enabled ? "" : " (disabled)"}`));
     out.push(g);
   }
   if (S.snap.pools.length) {

@@ -14,11 +14,20 @@ from __future__ import annotations
 import ipaddress
 import json
 import logging
+from pathlib import Path
 
 from .. import config
 from .shell import run, try_run
 
 log = logging.getLogger("vpngw.ifaces")
+
+
+def mtu_of(name: str) -> int:
+    """The interface's current MTU, or 0 when it cannot be read."""
+    try:
+        return int(Path(f"/sys/class/net/{name}/mtu").read_text().strip())
+    except (OSError, ValueError):
+        return 0
 
 
 def exists(iface: str) -> bool:

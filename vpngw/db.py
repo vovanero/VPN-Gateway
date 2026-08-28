@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS tunnel (
     dns            TEXT    NOT NULL DEFAULT '[]',
     endpoints      TEXT    NOT NULL DEFAULT '[]',
     endpoint_hosts TEXT    NOT NULL DEFAULT '[]',
+    via            TEXT    NOT NULL DEFAULT '',
     notes          TEXT    NOT NULL DEFAULT '',
     created_at     REAL    NOT NULL
 );
@@ -118,6 +119,13 @@ class Database:
         self.events_enabled = True
         with self._lock:
             self._conn.executescript(SCHEMA)
+            # v2 migration. ALTER is the whole upgrade path for existing
+            # gateways, so it must be safe to run on every start.
+            cols = {r["name"] for r in
+                    self._conn.execute("PRAGMA table_info(tunnel)")}
+            if "via" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE tunnel ADD COLUMN via TEXT NOT NULL DEFAULT ''")
 
     def close(self) -> None:
         with self._lock:
@@ -157,6 +165,7 @@ class Database:
             dns=json.loads(r["dns"]),
             endpoints=json.loads(r["endpoints"]),
             endpoint_hosts=json.loads(r["endpoint_hosts"]),
+            via=r["via"],
             notes=r["notes"],
         )
 
@@ -181,13 +190,13 @@ class Database:
         )
         cur = self._x(
             "INSERT INTO tunnel (slug, name, kind, esid, enabled, config_path,"
-            " mtu, dns, endpoints, endpoint_hosts, notes, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            " mtu, dns, endpoints, endpoint_hosts, via, notes, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 t.slug, t.name, t.kind.value, t.esid, int(t.enabled),
                 t.config_path, t.mtu, json.dumps(t.dns),
                 json.dumps(t.endpoints), json.dumps(t.endpoint_hosts),
-                t.notes, time.time(),
+                t.via, t.notes, time.time(),
             ),
         )
         t.id = cur.lastrowid
@@ -196,11 +205,11 @@ class Database:
     def update_tunnel(self, t: Tunnel) -> None:
         self._x(
             "UPDATE tunnel SET name=?, enabled=?, config_path=?, mtu=?, dns=?,"
-            " endpoints=?, endpoint_hosts=?, notes=? WHERE slug=?",
+            " endpoints=?, endpoint_hosts=?, via=?, notes=? WHERE slug=?",
             (
                 t.name, int(t.enabled), t.config_path, t.mtu, json.dumps(t.dns),
                 json.dumps(t.endpoints), json.dumps(t.endpoint_hosts),
-                t.notes, t.slug,
+                t.via, t.notes, t.slug,
             ),
         )
 
@@ -215,7 +224,98 @@ class Database:
             raise ValidationError(
                 f"tunnel {slug!r} is still the egress for: {names}"
             )
+        riders = self.riders_of(slug)
+        if riders:
+            names = ", ".join(t.slug for t in riders)
+            raise ValidationError(
+                f"tunnel {slug!r} still carries other tunnels: {names}. "
+                f"Unchain them first."
+            )
         self._x("DELETE FROM tunnel WHERE slug = ?", (slug,))
+
+    # -- chains (v2) --------------------------------------------------------
+
+    def chain_of(self, tunnel: Tunnel) -> list[Tunnel]:
+        """The tunnel and every ancestor it rides through, exit first.
+
+        [exit] for a normal tunnel; [exit, middle, entry] for a chain of
+        three. Walks defensively: a broken link (parent deleted out from
+        under us) ends the walk rather than raising, because this runs in
+        status paths that must never take the panel down.
+        """
+        out, seen = [tunnel], {tunnel.slug}
+        current = tunnel
+        while current.via and current.via not in seen:
+            parent = self.tunnel(current.via)
+            if parent is None:
+                break
+            out.append(parent)
+            seen.add(parent.slug)
+            current = parent
+        return out
+
+    def riders_of(self, slug: str) -> list[Tunnel]:
+        """Tunnels whose encrypted packets leave through this one."""
+        slug = normalise_slug(slug)
+        return [t for t in self.tunnels() if t.via == slug]
+
+    def validate_via(self, slug: str, via: str) -> None:
+        """Refuse a via assignment that cannot work.
+
+        Checked here, against the whole table, because none of these are
+        visible from one tunnel alone: a cycle needs the walk, the hop
+        ceiling needs the descendants too (inserting a parent under a
+        tunnel that already carries riders lengthens *their* chains), and
+        the endpoint clash needs every other tunnel's endpoints.
+        """
+        slug = normalise_slug(slug)
+        if not via:
+            return
+        via = normalise_slug(via)
+        if via == slug:
+            raise ValidationError(f"{slug!r} cannot route through itself")
+        tunnel = self.tunnel(slug)
+        parent = self.tunnel(via)
+        if tunnel is None:
+            raise ValidationError(f"no tunnel named {slug!r}")
+        if parent is None:
+            raise ValidationError(f"no tunnel named {via!r} to route through")
+
+        ancestry = self.chain_of(parent)
+        if any(t.slug == slug for t in ancestry):
+            names = " -> ".join(t.slug for t in ancestry)
+            raise ValidationError(
+                f"that would loop: {via} already routes through {names}")
+
+        # Longest path through this tunnel once linked: everything hanging
+        # below it, plus the parent's ancestry above it.
+        def depth_below(s: str) -> int:
+            kids = self.riders_of(s)
+            if not kids:
+                return 1
+            return 1 + max(depth_below(k.slug) for k in kids)
+
+        total = depth_below(slug) + len(ancestry)
+        if total > config.MAX_CHAIN_HOPS:
+            raise ValidationError(
+                f"a chain of {total} hops - the ceiling is "
+                f"{config.MAX_CHAIN_HOPS}. Each hop costs MTU, latency and "
+                f"about half the remaining throughput.")
+
+        # A chained tunnel's endpoint must stay OFF the WAN allow-list; an
+        # address shared with a WAN-reaching tunnel would have to stay on it.
+        chained_eps = set(tunnel.endpoints)
+        for other in self.tunnels():
+            if other.slug == slug or other.via:
+                continue
+            clash = chained_eps & set(other.endpoints)
+            if clash:
+                raise ValidationError(
+                    f"{slug} shares endpoint {sorted(clash)[0]} with "
+                    f"{other.slug}, which reaches it over the WAN. The "
+                    f"shared address would stay on the uplink allow-list "
+                    f"and quietly weaken the chain confinement. Use a "
+                    f"different server for one of them.")
 
     def next_tunnel_esid(self) -> int:
         return self._alloc_esid(

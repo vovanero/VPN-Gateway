@@ -1,7 +1,7 @@
-# v2 — chained tunnels (double / triple VPN)
+# v2 — chained tunnels (double VPN)
 
 The v2 headline: route one tunnel *through* another, so a client's traffic
-enters the internet through two (or three) VPNs in series.
+enters the internet through two VPNs in series.
 
 ```
 client → gateway → [entry: Mullvad SE] → [exit: IVPN CH] → internet
@@ -26,7 +26,7 @@ via = ""        # normal tunnel: encrypted packets leave over the WAN
 via = "nl01"    # chained: encrypted packets leave through tunnel nl01
 ```
 
-A chain of three is just `c.via = b`, `b.via = a`. Everything the tunnel
+Everything the tunnel
 already owns — esid, routing table, resolver, health, pool membership,
 client assignment — keeps working unchanged, because nothing about the
 tunnel's *inside* changes; only where its *outside* goes.
@@ -78,8 +78,11 @@ handshake to age out.
 
 ## Limits and validation
 
-- **Max 3 hops.** Each hop costs MTU, latency, and roughly half the
-  remaining throughput. Two is the sweet spot; three is the ceiling.
+- **Two hops: entry + exit.** Each extra hop costs MTU, latency, and
+  roughly half the remaining throughput, and the privacy argument is
+  already complete at two - no single provider sees both ends. The
+  mechanism is depth-agnostic, so the ceiling is one constant if that
+  ever changes.
 - No cycles (`a.via = b`, `b.via = a` is refused), no self-reference.
 - A chained tunnel's endpoint sharing an IP with a non-chained tunnel's is
   refused: the shared IP would have to stay on the WAN allow-list, which
@@ -97,10 +100,9 @@ A **Chains** section on the Tunnels page, drawn as the thing it is — a path:
 
 - Each hop is a node with its own live health dot, latency, and name; the
   exit node shows the measured exit IP. A sick hop is visibly the sick node.
-- **Builder, diagram-style:** pick an exit tunnel, click *route through* to
-  insert a parent, again for a third hop (the UI stops at three). Saving
-  writes the `via` fields. Dissolving a chain is one click and touches
-  nothing but `via`.
+- **Builder, diagram-style:** pick an exit tunnel, pick the entry it
+  routes through, save - that writes the `via` field. Dissolving a chain
+  is one click and touches nothing but `via`.
 - The client-assignment dropdown labels chained tunnels as what they are:
   `ca01 — chain via nl01`.
 - Effective MTU and summed latency shown per chain, because those are the

@@ -343,8 +343,17 @@ def cmd_tunnel_set(args, db: Database, settings) -> int:
         t.name = args.name
     if args.mtu:
         t.mtu = args.mtu
+    if args.via is not None:
+        via = "" if args.via in ("-", "none", "off") else args.via
+        db.validate_via(t.slug, via)
+        t.via = via
+    if args.disable and db.riders_of(t.slug):
+        names = ", ".join(r.slug for r in db.riders_of(t.slug))
+        raise SystemExit(f"{t.slug} still carries {names} - unchain them "
+                         f"before disabling it")
     db.update_tunnel(t)
-    print(f"{t.slug}: enabled={t.enabled} mtu={t.mtu or 'default'}")
+    chain = f" via={t.via}" if t.via else ""
+    print(f"{t.slug}: enabled={t.enabled} mtu={t.mtu or 'default'}{chain}")
     Daemon(settings).nudge()
     return 0
 
@@ -1006,6 +1015,9 @@ def build_parser() -> argparse.ArgumentParser:
     ts.add_argument("--disable", action="store_true")
     ts.add_argument("--name")
     ts.add_argument("--mtu", type=int)
+    ts.add_argument("--via", metavar="TUNNEL|-",
+                    help="route this tunnel's encrypted traffic through "
+                         "another tunnel (double VPN). '-' unchains it.")
     ts.set_defaults(func=cmd_tunnel_set)
 
     tr = t.add_parser("rm")

@@ -267,11 +267,27 @@ def create_app(service) -> FastAPI:
         if not t:
             raise HTTPException(status_code=404, detail="unknown tunnel")
         if "enabled" in body:
-            t.enabled = bool(body["enabled"])
+            wanted = bool(body["enabled"])
+            if not wanted:
+                riders = db.riders_of(t.slug)
+                if riders:
+                    names = ", ".join(r.slug for r in riders)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"{t.slug} still carries {names} - unchain "
+                               f"them before disabling it")
+            t.enabled = wanted
         if "name" in body:
             t.name = str(body["name"])
         if "mtu" in body:
             t.mtu = int(body["mtu"])
+        if "via" in body:
+            via = str(body["via"] or "").strip()
+            try:
+                db.validate_via(t.slug, via)
+            except ValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            t.via = via
         db.update_tunnel(t)
         return touched()
 
