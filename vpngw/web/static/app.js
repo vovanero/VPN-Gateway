@@ -618,58 +618,107 @@ function unchain(slug) {
 
 function openChainDialog() {
   const s = S.snap;
-  const riders = new Set(s.tunnels.filter((t) => t.via).map((t) => t.via));
-  // Entry: anything unchained. Exit: unchained AND not already carrying
-  // someone (the ceiling is two hops, so a carrier cannot also be an exit).
-  const entries = s.tunnels.filter((t) => !t.via);
-  const exits = s.tunnels.filter((t) => !t.via && !riders.has(t.slug));
-
-  if (s.tunnels.length < 2 || !entries.length || !exits.length) {
-    toast("warn", "Two tunnels needed",
-          "A double VPN is one tunnel routed through another - import a "
-          + "second tunnel first.");
+  if (s.tunnels.length < 2) {
+    toast("warn", "A double VPN needs two tunnels",
+          "One carries the other. Import a second tunnel first.");
     return;
   }
 
-  const pick = (name, list) => el("select", { name, class: "grow" },
-    ...list.map((t) => el("option", { value: t.slug },
-      `${t.name} (${t.slug})`)));
-  const entrySel = pick("entry", entries);
-  const exitSel = pick("exit", exits);
+  const riders = new Set(s.tunnels.filter((t) => t.via).map((t) => t.via));
+  const carried = Object.fromEntries(
+    s.tunnels.filter((t) => t.via).map((t) => [t.via, t.slug]));
+
+  // Why a tunnel cannot take a role, or "" when it can. Shown in the
+  // dropdown itself: an unpickable option that says why beats a hidden one.
+  const entryBlocked = (t) =>
+    t.via ? `already an exit via ${t.via}` : "";
+  const exitBlocked = (t) =>
+    t.via ? `already an exit via ${t.via}`
+    : riders.has(t.slug) ? `already the entry for ${carried[t.slug]}`
+    : "";
+
+  const pick = (name, blockedFn) => el("select", { name, class: "grow" },
+    ...s.tunnels.map((t) => {
+      const why = blockedFn(t);
+      return el("option", { value: t.slug, disabled: !!why },
+        `${t.name} (${t.slug})${why ? " — " + why : ""}`);
+    }));
+  const entrySel = pick("entry", entryBlocked);
+  const exitSel = pick("exit", exitBlocked);
+
+  const freeEntries = s.tunnels.filter((t) => !entryBlocked(t));
+  const freeExits = s.tunnels.filter((t) => !exitBlocked(t));
+  const buildable = freeEntries.length && freeExits.length &&
+    !(freeEntries.length === 1 && freeExits.length === 1 &&
+      freeEntries[0].slug === freeExits[0].slug);
 
   const dlg = $("#dlgChain");
   const host = $("#chainBuilder");
+
+  // Live detail under each dropdown: state, latency, and for the exit the
+  // address the internet would see. The strip updates as the picks change.
+  const hopInfo = (sel) => {
+    const t = s.tunnels.find((x) => x.slug === sel.value);
+    if (!t) return el("div", { class: "sub" }, "—");
+    return el("div", { class: "row",
+                       style: "gap:6px;justify-content:center;margin-top:6px" },
+      pill(t.enabled ? t.state : "disabled"),
+      el("span", { class: "sub num" },
+        t.rtt_ms ? `${Math.round(t.rtt_ms)} ms` : "—"),
+      el("span", { class: "sub mono" }, t.exit_ip || ""));
+  };
+  const entryInfo = el("div", {}), exitInfo = el("div", {});
+  const redraw = () => {
+    entryInfo.replaceChildren(hopInfo(entrySel));
+    exitInfo.replaceChildren(hopInfo(exitSel));
+  };
+
   host.replaceChildren(
     el("div", { class: "chain-strip", style: "margin-bottom:14px" },
       el("div", { class: "chain-end" },
         el("div", { class: "chain-end-label" }, "you")),
       chainArrow(),
       el("div", { class: "chain-hop unknown" },
-        el("div", { class: "sub" }, "entry — ISP sees this"), entrySel),
+        el("div", { class: "sub" }, "entry — ISP sees this"),
+        entrySel, entryInfo),
       chainArrow(),
       el("div", { class: "chain-hop unknown" },
-        el("div", { class: "sub" }, "exit — internet sees this"), exitSel),
+        el("div", { class: "sub" }, "exit — internet sees this"),
+        exitSel, exitInfo),
       chainArrow(),
       el("div", { class: "chain-end" },
         el("div", { class: "chain-end-label" }, "internet"))),
-    el("p", { class: "sub", style: "line-height:1.5" },
-      "The exit tunnel's encrypted traffic is routed through the entry "
-      + "instead of the uplink. Assign clients to the exit tunnel to use "
-      + "the chain. Two different providers make the strongest pair: "
-      + "neither one sees both who you are and where you go."));
+    buildable
+      ? el("p", { class: "sub", style: "line-height:1.5" },
+          "The exit tunnel's encrypted traffic is routed through the entry "
+          + "instead of the uplink. Assign clients to the exit tunnel to use "
+          + "the chain. Two different providers make the strongest pair: "
+          + "neither one sees both who you are and where you go.")
+      : el("p", { class: "sub",
+                  style: "line-height:1.5;color:var(--warn)" },
+          "Every tunnel is already part of a double VPN. Unchain the "
+          + "existing one first, or add another tunnel — each chain needs "
+          + "an entry and an exit of its own."));
 
   // Picking the same tunnel twice is nonsense the server would reject;
   // nicer to make it unpickable here.
   const sync = () => {
     for (const opt of exitSel.options)
-      opt.disabled = opt.value === entrySel.value;
-    if (exitSel.value === entrySel.value) {
+      opt.disabled = opt.value === entrySel.value ||
+                     !!exitBlocked(s.tunnels.find((t) => t.slug === opt.value));
+    if (exitSel.selectedOptions[0] && exitSel.selectedOptions[0].disabled) {
       const free = [...exitSel.options].find((o) => !o.disabled);
       if (free) exitSel.value = free.value;
     }
+    redraw();
   };
   entrySel.addEventListener("change", sync);
+  exitSel.addEventListener("change", redraw);
+  const firstEntry = [...entrySel.options].find((o) => !o.disabled);
+  if (firstEntry) entrySel.value = firstEntry.value;
   sync();
+
+  $("#chainCreate").disabled = !buildable;
   dlg.showModal();
 
   $("#formChain").onsubmit = async (ev) => {
