@@ -655,6 +655,40 @@ function openChainDialog() {
   const dlg = $("#dlgChain");
   const host = $("#chainBuilder");
 
+  // Nothing to build with: every tunnel is already in a chain. A form with
+  // an empty dropdown would only look broken; show the occupied chain and
+  // the two ways out instead.
+  if (!buildable) {
+    const bySlug = Object.fromEntries(s.tunnels.map((t) => [t.slug, t]));
+    $("#chainCreate").classList.add("hidden");
+    host.replaceChildren(
+      el("p", { class: "sub", style: "line-height:1.55;margin-bottom:14px" },
+        "Both tunnels are already linked as a double VPN. To build a "
+        + "different one, dissolve this chain first — or import another "
+        + "tunnel so a second chain has hops of its own."),
+      ...s.tunnels.filter((t) => t.via).map((exit) => {
+        const entry = bySlug[exit.via];
+        return el("div", { class: "chain-strip",
+                           style: "border:1px solid var(--border);"
+                                + "border-radius:var(--r);margin-bottom:12px" },
+          chainHop(entry, "entry"),
+          chainArrow(),
+          chainHop(exit, "exit"),
+          el("span", { class: "spacer" }),
+          el("button", { class: "btn", type: "button",
+            onclick: () => { dlg.close(); unchain(exit.slug); } },
+            "Unchain"));
+      }),
+      el("div", { class: "row", style: "gap:8px;margin-top:4px" },
+        el("button", { class: "btn primary", type: "button",
+          onclick: () => { dlg.close(); openTunnelDialog(); } },
+          icon("plus"), "Add another tunnel")));
+    $("#formChain").onsubmit = (ev) => ev.preventDefault();
+    dlg.showModal();
+    return;
+  }
+  $("#chainCreate").classList.remove("hidden");
+
   // Live detail under each dropdown: state, latency, and for the exit the
   // address the internet would see. The strip updates as the picks change.
   const hopInfo = (sel) => {
@@ -688,17 +722,11 @@ function openChainDialog() {
       chainArrow(),
       el("div", { class: "chain-end" },
         el("div", { class: "chain-end-label" }, "internet"))),
-    buildable
-      ? el("p", { class: "sub", style: "line-height:1.5" },
-          "The exit tunnel's encrypted traffic is routed through the entry "
-          + "instead of the uplink. Assign clients to the exit tunnel to use "
-          + "the chain. Two different providers make the strongest pair: "
-          + "neither one sees both who you are and where you go.")
-      : el("p", { class: "sub",
-                  style: "line-height:1.5;color:var(--warn)" },
-          "Every tunnel is already part of a double VPN. Unchain the "
-          + "existing one first, or add another tunnel — each chain needs "
-          + "an entry and an exit of its own."));
+    el("p", { class: "sub", style: "line-height:1.5" },
+      "The exit tunnel's encrypted traffic is routed through the entry "
+      + "instead of the uplink. Assign clients to the exit tunnel to use "
+      + "the chain. Two different providers make the strongest pair: "
+      + "neither one sees both who you are and where you go."));
 
   // Picking the same tunnel twice is nonsense the server would reject;
   // nicer to make it unpickable here.
@@ -718,7 +746,7 @@ function openChainDialog() {
   if (firstEntry) entrySel.value = firstEntry.value;
   sync();
 
-  $("#chainCreate").disabled = !buildable;
+  $("#chainCreate").disabled = false;
   dlg.showModal();
 
   $("#formChain").onsubmit = async (ev) => {
@@ -1963,7 +1991,8 @@ function renderPoolPicker() {
         el("div", {}, m.name),
         el("div", { class: "mono",
                     style: "font-size:11px;color:var(--text-3)" },
-          [m.slug, t.exit_ip, t.rtt_ms ? Math.round(t.rtt_ms) + " ms" : null]
+          [m.slug, t.via ? "double VPN via " + t.via : null, t.exit_ip,
+           t.rtt_ms ? Math.round(t.rtt_ms) + " ms" : null]
             .filter(Boolean).join(" · "))),
       t.state ? pill(t.enabled ? t.state : "disabled") : null,
       el("button", { type: "button", class: "btn sm ghost", disabled: i === 0,
@@ -1974,6 +2003,27 @@ function renderPoolPicker() {
   });
 
   host.replaceChildren(...rows);
+
+  // A chained exit next to its own entry: if the entry dies, both die.
+  // Worth having - exit-provider failure still fails over - but only when
+  // the person building the pool knows which failures it does not cover.
+  const chosenSlugs = new Set(chosen.map((m) => m.slug));
+  const overlaps = chosen
+    .map((m) => byslug[m.slug])
+    .filter((t) => t && t.via && chosenSlugs.has(t.via));
+  let warn = $("#poolChainWarn");
+  if (!warn) {
+    warn = el("div", { id: "poolChainWarn", class: "sub",
+                       style: "color:var(--warn);margin-top:8px;line-height:1.45" });
+    host.parentElement.insertBefore(warn, host.nextSibling);
+  }
+  warn.textContent = overlaps.length
+    ? overlaps.map((t) =>
+        `${t.name} rides through ${t.via}, which is also in this pool - if `
+        + `${t.via} dies they die together, and only the exit provider `
+        + `failing actually fails over.`).join(" ")
+    : "";
+
   const summary = $("#poolSummary");
   if (summary) {
     summary.textContent = chosen.length
