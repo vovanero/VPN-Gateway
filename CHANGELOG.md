@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.0.0 — double VPN
+
+Route one tunnel through another: the ISP sees only the entry hop, the
+internet only the exit hop, and no single provider sees both who you are
+and where you go.
+
+- **Chains are a property, not an object.** A tunnel gains `via`; chained,
+  its encrypted packets are fwmarked into the parent's routing table. The
+  parent's existing blackhole extends the kill switch through the chain —
+  a dead entry hop blocks the chain even with the daemon dead.
+- **Confinement, measured.** A chained tunnel's endpoint leaves the WAN
+  allow-list entirely. `tests/chain_test.sh` proves it with tcpdump: zero
+  packets to the exit provider on the uplink, chain up or down (9/9 on the
+  reference VM, with the v1 suites re-run green alongside).
+- **Panel.** A Double VPN section draws each chain as a path — ISP → entry
+  → exit → internet — with per-hop health, end-to-end latency, effective
+  MTU, a two-dropdown builder and one-click dissolve. Client dropdowns
+  label chained tunnels honestly: `ca01 — double VPN via nl01`.
+- **Everything composes.** A chained tunnel is still a tunnel: pools accept
+  it as a member, so `pool: [chain, single]` gives active/passive between
+  double VPN and a plain fallback.
+- MTU: derived from the parent when unset (each hop costs ~80 bytes), and
+  MTU edits now land on live interfaces without a re-up.
+- `vpngwctl tunnel set <exit> --via <entry>` / `--via -` from the CLI;
+  ceiling of two hops enforced with cycle and endpoint-clash validation.
+- Migration is one ALTER TABLE, run automatically and idempotently.
+
 ## 1.1.1
 
 - **No history by default.** A privacy gateway should hold no record of its

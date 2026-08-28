@@ -72,6 +72,29 @@ through the VPN; pools fail over with hysteresis and stickiness (measured:
 management is per interface — panel and SSH answer on the LAN by default, on
 the uplink only if you tick it.
 
+## Double VPN
+
+v2 routes one tunnel *through* another:
+
+```
+client → gateway → [entry: Amsterdam] → [exit: Canada] → internet
+                    ISP sees only this   exit IP is this
+```
+
+No single provider sees both who you are and where you go — pick two
+different providers and neither half has the whole picture. One field makes
+it real (`vpngwctl tunnel set ca01 --via nl01`, or two dropdowns in the
+panel), and the kill switch extends through the chain for free: the exit
+tunnel's encrypted packets are fwmarked into the entry's routing table,
+where the entry's own blackhole already waits. A dead entry hop *blocks*
+the chain — measured with tcpdump, not assumed: zero packets to the exit
+provider ever appear on the uplink, chain up or down
+([tests/chain_test.sh](tests/chain_test.sh)).
+
+A chained tunnel is still just a tunnel, so pools accept it as a member —
+`pool: [chain, single-hop]` is active/passive failover between double VPN
+and a plain fallback.
+
 ## What makes it different
 
 Plenty of routers can send different clients through different VPNs. The part
