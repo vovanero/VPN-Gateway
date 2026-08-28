@@ -668,16 +668,18 @@ function openChainDialog() {
         + "tunnel so a second chain has hops of its own."),
       ...s.tunnels.filter((t) => t.via).map((exit) => {
         const entry = bySlug[exit.via];
-        return el("div", { class: "chain-strip",
-                           style: "border:1px solid var(--border);"
-                                + "border-radius:var(--r);margin-bottom:12px" },
-          chainHop(entry, "entry"),
-          chainArrow(),
-          chainHop(exit, "exit"),
-          el("span", { class: "spacer" }),
-          el("button", { class: "btn", type: "button",
-            onclick: () => { dlg.close(); unchain(exit.slug); } },
-            "Unchain"));
+        return el("div", { style: "border:1px solid var(--border);"
+                                + "border-radius:var(--r);padding:12px 14px;"
+                                + "margin-bottom:12px" },
+          el("div", { class: "chain-vert" },
+            chainHop(entry, "entry"),
+            el("div", { class: "chain-varrow" }, "↓"),
+            chainHop(exit, "exit")),
+          el("div", { class: "row", style: "margin-top:10px" },
+            el("span", { class: "spacer" }),
+            el("button", { class: "btn sm", type: "button",
+              onclick: () => { dlg.close(); unchain(exit.slug); } },
+              "Unchain")));
       }),
       el("div", { class: "row", style: "gap:8px;margin-top:4px" },
         el("button", { class: "btn primary", type: "button",
@@ -689,17 +691,16 @@ function openChainDialog() {
   }
   $("#chainCreate").classList.remove("hidden");
 
-  // Live detail under each dropdown: state, latency, and for the exit the
-  // address the internet would see. The strip updates as the picks change.
+  // Live detail for the selected hop: state, latency, measured exit
+  // address - one row, full width, nothing to clip.
   const hopInfo = (sel) => {
     const t = s.tunnels.find((x) => x.slug === sel.value);
-    if (!t) return el("div", { class: "sub" }, "—");
-    return el("div", { class: "row",
-                       style: "gap:6px;justify-content:center;margin-top:6px" },
+    if (!t) return el("div", { class: "sub" }, "\u2014");
+    return el("div", { class: "row", style: "gap:8px;margin-top:8px" },
       pill(t.enabled ? t.state : "disabled"),
       el("span", { class: "sub num" },
-        t.rtt_ms ? `${Math.round(t.rtt_ms)} ms` : "—"),
-      el("span", { class: "sub mono" }, t.exit_ip || ""));
+        t.rtt_ms ? `${Math.round(t.rtt_ms)} ms` : "\u2014"),
+      el("span", { class: "sub mono ellip" }, t.exit_ip || ""));
   };
   const entryInfo = el("div", {}), exitInfo = el("div", {});
   const redraw = () => {
@@ -708,21 +709,19 @@ function openChainDialog() {
   };
 
   host.replaceChildren(
-    el("div", { class: "chain-strip", style: "margin-bottom:14px" },
-      el("div", { class: "chain-end" },
-        el("div", { class: "chain-end-label" }, "you")),
-      chainArrow(),
-      el("div", { class: "chain-hop unknown" },
-        el("div", { class: "sub" }, "entry — ISP sees this"),
+    el("div", { class: "chain-vert" },
+      el("div", { class: "chain-vend" }, "You \u00b7 what the ISP watches"),
+      el("div", { class: "chain-varrow" }, "\u2193"),
+      el("div", { class: "chain-vhop" },
+        el("div", { class: "chain-vrole" }, "Entry \u2014 the ISP sees only this server"),
         entrySel, entryInfo),
-      chainArrow(),
-      el("div", { class: "chain-hop unknown" },
-        el("div", { class: "sub" }, "exit — internet sees this"),
+      el("div", { class: "chain-varrow" }, "\u2193"),
+      el("div", { class: "chain-vhop" },
+        el("div", { class: "chain-vrole" }, "Exit \u2014 the internet sees this address"),
         exitSel, exitInfo),
-      chainArrow(),
-      el("div", { class: "chain-end" },
-        el("div", { class: "chain-end-label" }, "internet"))),
-    el("p", { class: "sub", style: "line-height:1.5" },
+      el("div", { class: "chain-varrow" }, "\u2193"),
+      el("div", { class: "chain-vend" }, "Internet")),
+    el("p", { class: "sub", style: "line-height:1.5;margin-top:14px" },
       "The exit tunnel's encrypted traffic is routed through the entry "
       + "instead of the uplink. Assign clients to the exit tunnel to use "
       + "the chain. Two different providers make the strongest pair: "

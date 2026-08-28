@@ -571,6 +571,27 @@ input:user-invalid, select:user-invalid { border-color: var(--danger); }
   color: var(--text-3); margin-bottom: 2px;
 }
 
+/* The builder dialog stacks the chain vertically: a dialog is narrow, and
+   a horizontal path in it clips its own labels. */
+.chain-vert { display: flex; flex-direction: column; }
+.chain-vhop {
+  border: 1px solid var(--border-2); border-radius: var(--r);
+  background: var(--surface-2); padding: 12px 14px;
+}
+.chain-vhop select { width: 100%; margin-top: 6px; }
+.chain-vrole {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--text-3);
+}
+.chain-varrow { text-align: center; color: var(--text-3); padding: 2px 0;
+                line-height: 1; }
+.chain-vend {
+  text-align: center; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--text-3);
+}
+.ellip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+         min-width: 0; }
+
 /* Sticky, because the form is long and the button that commits it should not
    be something you have to scroll to find. */
 .apply-bar {
