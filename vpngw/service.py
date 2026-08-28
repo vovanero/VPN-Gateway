@@ -328,8 +328,15 @@ class Service:
                 "clients_blocked": sum(1 for c in client_rows
                                        if c["enabled"] and c["egress_state"] != "up"),
                 "clients_total": len(client_rows),
-                "rx_rate": sum(t["rx_rate"] for t in tunnel_rows),
-                "tx_rate": sum(t["tx_rate"] for t in tunnel_rows),
+                # WAN-facing tunnels only. A chained tunnel's traffic is
+                # already inside its parent's counters - the same bytes,
+                # re-encrypted - so summing every tunnel double-counts the
+                # moment a chain carries load. The WAN-facing sum is what
+                # actually leaves the machine.
+                "rx_rate": sum(t["rx_rate"] for t in tunnel_rows
+                               if not t["via"]),
+                "tx_rate": sum(t["tx_rate"] for t in tunnel_rows
+                               if not t["via"]),
             },
             "system": {
                 "version": __import__("vpngw").__version__,

@@ -422,12 +422,16 @@ function renderDashboard(host) {
     statTile("Download", rate(t.rx_rate), "across all tunnels", "", "down"),
     statTile("Upload", rate(t.tx_rate), "across all tunnels", "", "up"));
 
-  // Aggregate throughput across every tunnel, aligned on sample index.
-  const len = Math.max(0, ...s.tunnels.map((x) => x.history.length));
+  // Aggregate throughput across WAN-facing tunnels, aligned on sample
+  // index. Chained tunnels are skipped: their bytes are already inside the
+  // parent's counters - the same payload, re-encrypted - and counting both
+  // would double every chained megabyte.
+  const wanFacing = s.tunnels.filter((tn) => !tn.via);
+  const len = Math.max(0, ...wanFacing.map((x) => x.history.length));
   const rx = [], tx = [];
   for (let i = 0; i < len; i++) {
     let r = 0, x = 0;
-    for (const tn of s.tunnels) {
+    for (const tn of wanFacing) {
       const off = tn.history.length - len + i;
       if (off >= 0 && tn.history[off]) { r += tn.history[off].rx; x += tn.history[off].tx; }
     }
@@ -436,10 +440,11 @@ function renderDashboard(host) {
 
   const throughput = el("div", { class: "card" },
     el("div", { class: "card-head" },
-      el("div", {}, el("h3", {}, "Trafik"),
+      el("div", {}, el("h3", {}, "Traffic"),
         el("p", {}, `last ${Math.round(len * s.system.probe_interval / 60)} minutes · one sample every ${s.system.probe_interval}s`))),
     el("div", { class: "card-body" },
-      chart([{ values: rx, color: COLOR.rx }, { values: tx, color: COLOR.tx }]),
+      chart([{ values: rx, color: COLOR.rx }, { values: tx, color: COLOR.tx }],
+            { unit: (v) => bytes(v) + "/s" }),
       el("div", { class: "legend" },
         el("span", {}, el("i", { style: `background:${COLOR.rx}` }), "download"),
         el("span", {}, el("i", { style: `background:${COLOR.tx}` }), "upload"))));
@@ -470,7 +475,7 @@ function renderDashboard(host) {
           el("span", { class: "mark" }, icon(ic)),
           el("div", {}, el("b", {}, title), el("span", {}, body)))))
     ] : [
-      el("div", { class: "section-title" }, "Durum"),
+      el("div", { class: "section-title" }, "Status"),
       el("div", { class: "card" }, el("div", { class: "empty" },
         icon("check", "ic"), el("b", {}, "All good"),
         el("p", {}, "Every tunnel is up and every client has a working exit.")))
@@ -1773,7 +1778,7 @@ function renderDrawer() {
     el("div", { class: "card" }, el("div", { class: "card-body" },
       chart([{ values: t.history.map((h) => h.rx), color: COLOR.rx },
              { values: t.history.map((h) => h.tx), color: COLOR.tx }],
-            { height: 130 }),
+            { height: 130, unit: (v) => bytes(v) + "/s" }),
       el("div", { class: "legend" },
         el("span", {}, el("i", { style: `background:${COLOR.rx}` }), "download " + rate(t.rx_rate)),
         el("span", {}, el("i", { style: `background:${COLOR.tx}` }), "upload " + rate(t.tx_rate))))),
