@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.0.1
+
+Reported by a user who could not get out of a corner the panel had put
+them in.
+
+- **"Remove account" had no endpoint behind it.** The panel called
+  `POST /api/providers/{id}/logout`; the route was never written, so the
+  button answered 404 for the life of the project. A provider account
+  could be added from the panel but only removed with `vpngwctl` — and
+  because a second account cannot be stored while the first one is, the
+  operator was locked to whichever account they first typed in. The route
+  now exists, forgets the credentials, closes the provider's API access,
+  and leaves already-provisioned tunnels alone: they hold their own keys.
+  A test now asserts that every provider path the panel calls exists in
+  the API, so a UI-only route cannot go missing again.
+- **Deleting a tunnel was a dead end.** Refusing to delete a tunnel a
+  client still points at is correct — a dangling exit means a client with
+  no internet — but the panel relayed the refusal as a toast and stopped
+  there. It now names the blocker before asking: a double VPN that must be
+  dissolved, a pool the tunnel belongs to, or the clients using it, and in
+  the last case offers to unassign them as part of the delete.
+
 ## 2.0.0 — double VPN
 
 Route one tunnel through another: the ISP sees only the entry hop, the

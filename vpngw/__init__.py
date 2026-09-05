@@ -11,5 +11,5 @@ A PARTICULAR PURPOSE. See the GNU General Public License for details, in the
 LICENSE file distributed with this program, or <https://www.gnu.org/licenses/>.
 """
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __license__ = "GPL-3.0-or-later"

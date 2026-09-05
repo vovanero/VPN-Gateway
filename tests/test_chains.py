@@ -219,3 +219,35 @@ class TestOpenvpnMark(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestProviderLogoutRoute(unittest.TestCase):
+    """The panel's Remove account button had no endpoint behind it.
+
+    It answered 404 for the life of the project, so a provider account
+    could be added from the panel but never removed there - and since a
+    second account cannot be stored while the first one is, the operator
+    was stuck with whichever account they first typed in. The route is
+    trivial; that it was missing was invisible because nothing tested that
+    the paths the UI calls actually exist.
+    """
+
+    def test_every_provider_path_the_panel_calls_exists(self):
+        import re
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        js = (root / "vpngw" / "web" / "static" / "app.js").read_text(
+            encoding="utf-8")
+        api = (root / "vpngw" / "api.py").read_text(encoding="utf-8")
+
+        # Paths the panel calls, as template literals: /api/providers/${x}/verb
+        called = set(re.findall(
+            r'/api/providers/\$\{[^}]+\}/([a-z_]+)', js))
+        declared = set(re.findall(
+            r'@app\.\w+\("/api/providers/\{provider_id\}/([a-z_]+)"', api))
+
+        missing = sorted(called - declared)
+        self.assertFalse(
+            missing,
+            f"the panel calls provider endpoints that do not exist: {missing}")

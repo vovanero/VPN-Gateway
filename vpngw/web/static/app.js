@@ -1819,11 +1819,56 @@ const toggleTunnel = (t) =>
     `'${t.name}' ${t.enabled ? "disabled" : "enabled"}`);
 
 async function removeTunnel(t) {
-  const users = t.direct_clients + t.pool_clients;
-  const ok = await confirmDialog(`Delete '${t.name}'?`,
-    users ? `${users} client(s) use this tunnel. Move them to another exit first.`
-          : "Its config file and keys are deleted too. This cannot be undone.");
-  if (!ok) return;
+  // The server refuses to delete a tunnel a client still points at - a
+  // client left with a dangling exit is a client with no internet. The
+  // panel used to relay that refusal as a toast and stop there, which left
+  // the operator holding a tunnel they could not remove and no route to
+  // fixing it. Offer the fix instead.
+  const direct = (S.snap.clients || []).filter(
+    (c) => c.egress_kind === "tunnel" && c.egress_slug === t.slug);
+  const pools = (S.snap.pools || []).filter(
+    (p) => (p.members || []).some((m) => (m.slug || m) === t.slug));
+  const riders = (S.snap.tunnels || []).filter((x) => x.via === t.slug);
+
+  if (riders.length) {
+    await confirmDialog(`'${t.name}' cannot be deleted yet`,
+      `It is the entry hop for ${riders.map((r) => r.name).join(", ")}. `
+      + "Dissolve that double VPN first - the Unchain button on the chain "
+      + "card - then delete this tunnel.", "Got it");
+    return;
+  }
+  if (pools.length) {
+    await confirmDialog(`'${t.name}' cannot be deleted yet`,
+      `It is a member of ${pools.map((p) => p.name).join(", ")}. Remove it `
+      + "from the pool first, or the pool would be left with a member that "
+      + "no longer exists.", "Got it");
+    return;
+  }
+
+  if (direct.length) {
+    const names = direct.map((c) => c.name || c.ip).join(", ");
+    const ok = await confirmDialog(`Delete '${t.name}'?`,
+      `${names} ${direct.length === 1 ? "uses" : "use"} this tunnel. `
+      + "Deleting it leaves them with no exit, which means no internet "
+      + "until you assign them somewhere else - blocked, not leaking.\n\n"
+      + "Continue and unassign "
+      + `${direct.length === 1 ? "it" : "them"}?`,
+      "Unassign and delete");
+    if (!ok) return;
+    for (const c of direct) {
+      try {
+        await api("/api/clients/" + c.ip, "PATCH", { egress: "" });
+      } catch (err) {
+        toast("err", `Could not unassign ${c.name || c.ip}`, err.message);
+        return;
+      }
+    }
+  } else {
+    const ok = await confirmDialog(`Delete '${t.name}'?`,
+      "Its config file and keys are deleted too. This cannot be undone.");
+    if (!ok) return;
+  }
+
   await mutate(() => api("/api/tunnels/" + t.slug, "DELETE"), "Tunnel deleted");
   if (S.drawerSlug === t.slug) closeDrawer();
 }

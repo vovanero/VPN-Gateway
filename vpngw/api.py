@@ -703,6 +703,32 @@ def create_app(service) -> FastAPI:
             } for l in locations[:limit]],
         }
 
+    @app.post("/api/providers/{provider_id}/logout")
+    def provider_logout(provider_id: str,
+                        x_vpngw_token: str | None = Header(default=None)) -> dict:
+        """Forget a provider's credentials and close its API access.
+
+        The panel has always had a button for this; the endpoint behind it
+        was never written, so it answered 404 and the account could only be
+        removed with vpngwctl. Tunnels already provisioned keep working -
+        they hold their own keys - which is why this does not touch them.
+        """
+        from . import providers as registry
+        from .providers import store
+
+        authorise(x_vpngw_token)
+        from .providers import ProviderError
+
+        try:
+            registry.get(provider_id)      # rejects an unknown provider
+        except ProviderError as exc:
+            raise HTTPException(status_code=404, detail=str(exc))
+        store.forget(provider_id)
+        service.reconciler.disable_provider(provider_id)
+        db.log_event("warning", "provider",
+                     f"{provider_id}: credentials removed, API access closed")
+        return touched()
+
     @app.post("/api/providers/{provider_id}/tunnels")
     def provider_add_tunnel(provider_id: str, body: dict = Body(...),
                             x_vpngw_token: str | None = Header(default=None)) -> dict:
