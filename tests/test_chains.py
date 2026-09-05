@@ -251,3 +251,34 @@ class TestProviderLogoutRoute(unittest.TestCase):
         self.assertFalse(
             missing,
             f"the panel calls provider endpoints that do not exist: {missing}")
+
+
+class TestDeleteRoutesAreHonest(unittest.TestCase):
+    """Deleting something that is not there must not report success.
+
+    Every delete endpoint used to answer 200 for an unknown id, so the
+    panel said "Pool deleted" and refreshed while nothing had happened.
+    A false success is worst exactly when something else is already wrong -
+    a stale page, a slug that is not what the operator thinks it is.
+    """
+
+    def test_each_delete_checks_the_resource_exists_first(self):
+        import re
+        from pathlib import Path
+
+        api = (Path(__file__).resolve().parent.parent / "vpngw" / "api.py"
+               ).read_text(encoding="utf-8")
+
+        for resource, lookup in (("tunnels", "db.tunnel("),
+                                 ("pools", "db.pool("),
+                                 ("clients", "db.client(")):
+            with self.subTest(resource=resource):
+                m = re.search(
+                    r'@app\.delete\("/api/' + resource + r'/\{[^}]+\}"\)'
+                    r'(.*?)(?=\n    @app\.|\Z)', api, re.S)
+                self.assertIsNotNone(m, f"no delete route for {resource}")
+                body = m.group(1)
+                self.assertIn(lookup, body,
+                              f"{resource} delete does not look the resource up")
+                self.assertIn("404", body,
+                              f"{resource} delete does not 404 on an unknown id")

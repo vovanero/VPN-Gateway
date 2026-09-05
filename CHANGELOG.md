@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.1
+## 2.0.2
 
 Reported by a user who could not get out of a corner the panel had put
 them in.
@@ -15,6 +15,12 @@ them in.
   and leaves already-provisioned tunnels alone: they hold their own keys.
   A test now asserts that every provider path the panel calls exists in
   the API, so a UI-only route cannot go missing again.
+- **Deleting something that was not there reported success.** All three
+  delete endpoints answered 200 for an unknown id, so the panel said
+  "Pool deleted" and refreshed while nothing had happened — worst exactly
+  when something else is already wrong, such as a stale page or a slug
+  that is not what the operator thinks it is. Each now looks the resource
+  up and 404s, matching every other verb on the same paths.
 - **Deleting a tunnel was a dead end.** Refusing to delete a tunnel a
   client still points at is correct — a dangling exit means a client with
   no internet — but the panel relayed the refusal as a toast and stopped

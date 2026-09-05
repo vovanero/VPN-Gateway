@@ -295,6 +295,8 @@ def create_app(service) -> FastAPI:
     def delete_tunnel(slug: str,
                       x_vpngw_token: str | None = Header(default=None)) -> dict:
         authorise(x_vpngw_token)
+        if not db.tunnel(slug):
+            raise HTTPException(status_code=404, detail="unknown tunnel")
         db.delete_tunnel(slug)
         for suffix in (".json", ".ovpn", ".auth"):
             (config.SECRETS_DIR / f"{slug}{suffix}").unlink(missing_ok=True)
@@ -348,6 +350,8 @@ def create_app(service) -> FastAPI:
     def delete_pool(slug: str,
                     x_vpngw_token: str | None = Header(default=None)) -> dict:
         authorise(x_vpngw_token)
+        if not db.pool(slug):
+            raise HTTPException(status_code=404, detail="unknown pool")
         db.delete_pool(slug)
         return touched()
 
@@ -401,9 +405,10 @@ def create_app(service) -> FastAPI:
                       x_vpngw_token: str | None = Header(default=None)) -> dict:
         authorise(x_vpngw_token)
         existing = db.client(ip)
+        if not existing:
+            raise HTTPException(status_code=404, detail="unknown client")
         db.delete_client(ip)
-        if existing:
-            db.log_event("warning", ip, f"client {existing.name} removed")
+        db.log_event("warning", ip, f"client {existing.name} removed")
         return touched()
 
     # -- operations --------------------------------------------------------
