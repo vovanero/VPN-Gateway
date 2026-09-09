@@ -410,10 +410,16 @@ def render_killswitch(settings: Settings) -> str:
     # ruleset does. If it did not, a boot where vpngw fails to start would be
     # unreachable - fail-closed for clients is correct, but locking the
     # operator out of a box that needs fixing is just a brick.
+    # The panel's port is opened here too, even though nothing is listening
+    # on it while the skeleton is what is loaded. That is the point: a boot
+    # where the daemon failed then answers "connection refused" instead of
+    # timing out, which tells the operator the firewall is fine and the
+    # daemon is not - the difference between a diagnosis and a guess.
     admin_rules = []
     for iface in net.management_ifaces():
         admin_rules.append(
-            f'        iifname "{iface}" tcp dport {{ 22 }} accept'
+            f'        iifname "{iface}" tcp dport {{ 22, {settings.api.port} }} '
+            f'accept'
         )
     admin_block = "\n".join(admin_rules) or (
         "        # no management path configured - see [net] in vpngw.toml"

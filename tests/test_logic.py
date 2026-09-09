@@ -439,8 +439,16 @@ class TestNftRender(unittest.TestCase):
         settings = config.Settings(net=config.NetSettings(
             mgmt_iface="", admin_ifaces=("br-lan", "wan0")))
         text = nftables.render_killswitch(settings)
-        self.assertIn('iifname "br-lan" tcp dport { 22 } accept', text)
-        self.assertIn('iifname "wan0" tcp dport { 22 } accept', text)
+        # The point is that the door is open on every management interface,
+        # not which ports are behind it - the skeleton now carries the panel
+        # port as well, so a boot where the daemon died refuses the
+        # connection instead of hanging.
+        for iface in ("br-lan", "wan0"):
+            line = next((l for l in text.splitlines()
+                         if f'iifname "{iface}"' in l and "tcp dport" in l), "")
+            self.assertTrue(line, f"no management rule for {iface}")
+            self.assertIn("22", line)
+            self.assertIn("accept", line)
 
     def test_clients_can_never_reach_the_management_ports(self):
         for net in (config.NetSettings(),

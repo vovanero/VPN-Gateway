@@ -108,17 +108,78 @@ WAN_CIDR=$(ip -4 -o addr show dev "$WAN" 2>/dev/null | awk '{print $4; exit}' ||
 # exists). The uplink joins only when the operator says so - typically because
 # they administer the box from the network the uplink sits on, which is the
 # common two-adapter lab layout.
-ADMIN_WAN="${VPNGW_ADMIN_WAN:-}"
+wan_is_private() {
+    [[ -n "$WAN_CIDR" ]] || return 1
+    python3 - "$WAN_CIDR" <<'PY'
+import ipaddress, sys
+try:
+    addr = ipaddress.ip_interface(sys.argv[1]).ip
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if addr.is_private else 1)
+PY
+}
+
+# Default on for a private uplink - that is the lab layout, and it is where
+# the operator is standing. Off for a routable one: a panel that controls a
+# kill switch does not belong on the public internet by default.
+if [[ -n "${VPNGW_ADMIN_WAN+set}" ]]; then
+    ADMIN_WAN="$VPNGW_ADMIN_WAN"
+elif wan_is_private; then
+    ADMIN_WAN=1
+else
+    ADMIN_WAN=
+fi
+
 if [[ -n "$MGMT" ]]; then
     ok "management interface: $MGMT"
 else
-    warn "no spare adapter for a management segment; the panel answers on the"
-    warn "LAN bridge. If you administer from the uplink's network, answer yes"
-    warn "below (or set VPNGW_ADMIN_WAN=1)."
+    if [[ -n "$ADMIN_WAN" ]]; then
+        ok "no management adapter; the panel answers on the LAN bridge and"
+        ok "on the uplink, which is private here"
+    else
+        warn "no spare adapter for a management segment; the panel answers on"
+        warn "the LAN bridge only - the uplink is publicly routable. If you"
+        warn "administer from it anyway, answer yes below."
+    fi
 fi
 
-LAN_CIDR="${VPNGW_LAN_CIDR:-10.10.0.1/24}"
+# The default has to dodge the uplink. Offering a client network that
+# overlaps it invites an Enter keypress into a broken gateway: two
+# interfaces on one subnet, and traffic for the uplink's own network
+# treated as local by the client side.
+lan_overlaps_wan() {
+    # lan_overlaps_wan <lan-cidr> -> 0 when they overlap
+    [[ -n "$WAN_CIDR" ]] || return 1
+    python3 - "$1" "$WAN_CIDR" <<'PY'
+import ipaddress, sys
+try:
+    lan = ipaddress.ip_interface(sys.argv[1]).network
+    wan = ipaddress.ip_interface(sys.argv[2]).network
+except ValueError:
+    raise SystemExit(1)
+raise SystemExit(0 if lan.overlaps(wan) else 1)
+PY
+}
+
+pick_default_lan() {
+    for candidate in 10.10.0.1/24 10.20.0.1/24 10.30.0.1/24 \
+                     172.20.0.1/24 192.168.90.1/24; do
+        lan_overlaps_wan "$candidate" || { echo "$candidate"; return; }
+    done
+    echo 10.10.0.1/24
+}
+
+LAN_CIDR="${VPNGW_LAN_CIDR:-$(pick_default_lan)}"
+if lan_overlaps_wan "$LAN_CIDR"; then
+    die "the client network $LAN_CIDR overlaps the uplink's ($WAN_CIDR).
+       Both interfaces would sit on one subnet: routing between them is
+       ambiguous, and traffic for the uplink's own network would be treated
+       as local by the client side. Choose a different range with
+       VPNGW_LAN_CIDR, or answer the client-network prompt below."
+fi
 ok "client network: $LAN_CIDR"
+[[ -n "$WAN_CIDR" ]] && ok "does not overlap the uplink ($WAN_CIDR)"
 
 # ---------------------------------------------------------------------------
 # Interactive review. Everything above was detected; this is the chance to
@@ -148,7 +209,12 @@ EOF
     echo "  The gateway's own address on the client segment. Clients use it as"
     echo "  their default route. Any private range works - it does not have to"
     echo "  be 10.10.0.1/24."
-    ask "Client network (address/prefix)" "$LAN_CIDR" LAN_CIDR
+    while :; do
+        ask "Client network (address/prefix)" "$LAN_CIDR" LAN_CIDR
+        lan_overlaps_wan "$LAN_CIDR" || break
+        warn "that overlaps the uplink's network ($WAN_CIDR) - both adapters"
+        warn "would be on one subnet. Pick a different range."
+    done
 
     echo
     echo "  Management: how you will reach SSH and the web panel."
@@ -156,7 +222,16 @@ EOF
         ask "Management interface (blank to use the uplink instead)" "$MGMT" MGMT
     fi
     echo "  The panel and SSH answer on the LAN bridge${MGMT:+ and $MGMT}."
-    ask "Also answer on the uplink ($WAN)? [y/N]" "${ADMIN_WAN:+y}" ADMIN_WAN_ANSWER
+    if [[ -n "$ADMIN_WAN" ]]; then
+        echo "  The uplink ($WAN${WAN_CIDR:+ $WAN_CIDR}) is a private network, so"
+        echo "  answering there too is the default - it is usually where you are."
+    else
+        echo "  The uplink ($WAN${WAN_CIDR:+ $WAN_CIDR}) is publicly routable."
+        echo "  Answering there would put this panel on the internet; say yes"
+        echo "  only if you know that is what you want."
+    fi
+    ask "Also answer on the uplink ($WAN)?${ADMIN_WAN:+ [Y/n]}${ADMIN_WAN:- [y/N]}" \
+        "${ADMIN_WAN:+y}" ADMIN_WAN_ANSWER
     case "${ADMIN_WAN_ANSWER,,}" in
         y|yes|1) ADMIN_WAN=1 ;;
         *)       ADMIN_WAN=  ;;
@@ -493,6 +568,18 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
+# An example the operator can paste: the .11 host of their own client
+# network, not of whatever the default happened to be.
+EXAMPLE_CLIENT=$(python3 - "$LAN_CIDR" <<'PY'
+import ipaddress, sys
+try:
+    net = ipaddress.ip_interface(sys.argv[1]).network
+    print(next(h for i, h in enumerate(net.hosts()) if i == 10))
+except Exception:
+    print("10.10.0.11")
+PY
+)
+
 say "installed"
 cat <<EOF
 
@@ -507,11 +594,15 @@ cat <<EOF
   Next:
     1. Start the daemon:      systemctl start vpngw
     2. Import a tunnel:       vpngwctl tunnel import nl01 /root/mullvad-nl.conf
-    3. Add a client:          vpngwctl client add pc01 10.10.0.11 --egress tunnel:nl01
+    3. Add a client:          vpngwctl client add pc01 $EXAMPLE_CLIENT --egress tunnel:nl01
     4. Check it:              vpngwctl status
     5. Prove it:              vpngwctl selftest --disrupt
 
-  Web UI: http://10.10.0.1:8080 (from the LAN)${ADMIN_WAN:+  or  http://${WAN_CIDR%%/*}:8080}
+  The panel answers only once the daemon is running: until then the boot
+  skeleton keeps everything but SSH closed, because there is nothing to
+  serve yet.
+
+  Web UI: http://${LAN_CIDR%%/*}:8080 (from the LAN)${ADMIN_WAN:+  or  http://${WAN_CIDR%%/*}:8080 (from the uplink)}
 
   Step 5 is the one that matters. Until it passes, treat this gateway as
   untested rather than leak-proof.
