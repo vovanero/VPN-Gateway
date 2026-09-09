@@ -282,3 +282,53 @@ class TestDeleteRoutesAreHonest(unittest.TestCase):
                               f"{resource} delete does not look the resource up")
                 self.assertIn("404", body,
                               f"{resource} delete does not 404 on an unknown id")
+
+
+class TestImportBornChained(unittest.TestCase):
+    """A tunnel that is to be chained must never be enabled unchained.
+
+    The reason is one packet: an enabled, unchained tunnel handshakes over
+    the uplink on the reconcile loop's next pass, and the new provider's
+    relay logs the real address. For a double VPN that is the single thing
+    the operator was avoiding, and no later chaining takes the record back.
+    So the import creates it disabled, chains it, and only then enables it -
+    inside one request, where no reconcile pass can see the gap.
+    """
+
+    def test_the_import_handler_enables_only_after_chaining(self):
+        import re
+        from pathlib import Path
+
+        api = (Path(__file__).resolve().parent.parent / "vpngw" / "api.py"
+               ).read_text(encoding="utf-8")
+        m = re.search(r'@app\.post\("/api/tunnels/import"\)(.*?)'
+                      r'(?=\n    @app\.)', api, re.S)
+        self.assertIsNotNone(m, "no import route")
+        body = m.group(1)
+
+        self.assertIn("enabled=not via", body,
+                      "import does not create a to-be-chained tunnel disabled")
+        create = body.index("db.add_tunnel")
+        enable = body.find("tunnel.enabled = True")
+        self.assertGreater(enable, create,
+                           "the tunnel is enabled before it is chained")
+        via_set = body.find("tunnel.via =")
+        self.assertLess(via_set, enable,
+                        "via is assigned after enabling - leaves a live window")
+
+    def test_a_refused_chain_leaves_the_tunnel_switched_off(self):
+        """Refusing the chain must not fall back to an unchained, live
+        tunnel: that is the leak with extra steps."""
+        import re
+        from pathlib import Path
+
+        api = (Path(__file__).resolve().parent.parent / "vpngw" / "api.py"
+               ).read_text(encoding="utf-8")
+        m = re.search(r'@app\.post\("/api/tunnels/import"\)(.*?)'
+                      r'(?=\n    @app\.)', api, re.S)
+        body = m.group(1)
+        guard = re.search(r"except ValidationError as exc:(.*?)raise HTTPException",
+                          body, re.S)
+        self.assertIsNotNone(guard, "no validation guard around via")
+        self.assertNotIn("tunnel.enabled = True", guard.group(1),
+                         "the failure path enables the tunnel anyway")

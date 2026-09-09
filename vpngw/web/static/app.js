@@ -1911,6 +1911,20 @@ const setMaintenance = (minutes) =>
 /* ── dialogs ───────────────────────────────────────────────────────────── */
 
 function openTunnelDialog() {
+  // Offer every existing unchained tunnel as a possible entry hop. Chained
+  // ones are excluded: the ceiling is two, and a tunnel that already rides
+  // through another cannot carry a third.
+  const sel = $("#importVia");
+  if (sel) {
+    const usable = (S.snap?.tunnels || []).filter((t) => !t.via);
+    sel.replaceChildren(
+      el("option", { value: "" },
+        "Nothing — this tunnel dials out over the uplink"),
+      ...usable.map((t) => el("option", { value: t.slug },
+        `${t.name} (${t.slug})`)));
+    sel.disabled = !usable.length;
+  }
+
   const f = $("#formTunnel");
   f.reset();
   $("#dropLabel").textContent = "Drop a file here, or click to choose";
@@ -1926,7 +1940,8 @@ $("#formTunnel").addEventListener("submit", async (ev) => {
 
   const params = new URLSearchParams({
     slug: f.slug.value.toLowerCase(), name: f.name.value,
-    auth_user: f.auth_user.value, auth_pass: f.auth_pass.value });
+    auth_user: f.auth_user.value, auth_pass: f.auth_pass.value,
+    via: f.via ? f.via.value : "" });
   const body = new FormData();
   body.append("file", file);
 
@@ -1934,7 +1949,10 @@ $("#formTunnel").addEventListener("submit", async (ev) => {
     const res = await fetch("/api/tunnels/import?" + params, { method: "POST", body });
     if (!res.ok) throw new Error((await res.json()).detail || res.statusText);
     const data = await res.json();
-    toast("ok", `Imported '${data.slug}'`, `interface ${data.iface}`);
+    toast("ok", `Imported '${data.slug}'`,
+      data.via
+        ? `Routed through ${data.via} from its first packet — ${data.iface}`
+        : `interface ${data.iface}`);
     if (!data.endpoints.length) {
       toast("err", "No endpoint resolved",
         "Under strict host egress the firewall will not let this tunnel connect. Check DNS.");

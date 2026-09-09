@@ -32,6 +32,7 @@ from .models import (
     Tunnel,
     TunnelKind,
     ValidationError,
+    normalise_slug,
 )
 
 log = logging.getLogger("vpngw.api")
@@ -210,7 +211,7 @@ def create_app(service) -> FastAPI:
     @app.post("/api/tunnels/import")
     async def import_tunnel(
         slug: str, file: UploadFile, name: str = "", kind: str = "",
-        auth_user: str = "", auth_pass: str = "",
+        auth_user: str = "", auth_pass: str = "", via: str = "",
         x_vpngw_token: str | None = Header(default=None),
     ) -> dict:
         authorise(x_vpngw_token)
@@ -249,15 +250,39 @@ def create_app(service) -> FastAPI:
                                 f"{auth_user}\n{auth_pass}\n")
 
         addrs, names = resolve_endpoints(hosts)
+        # Born disabled when it is to be chained: the reconcile loop must
+        # never find it enabled and unchained, because that is the pass in
+        # which it would hand the new provider the WAN address.
         tunnel = db.add_tunnel(Tunnel(
             slug=slug, name=name or slug, kind=TunnelKind(detected),
             esid=db.next_tunnel_esid(), config_path=str(stored),
             mtu=mtu, dns=dns, endpoints=addrs, endpoint_hosts=names,
+            enabled=not via,
         ))
-        db.log_event("info", tunnel.slug, f"imported ({detected})")
+        chained = False
+        if via:
+            try:
+                db.validate_via(tunnel.slug, via)
+            except ValidationError as exc:
+                # Leave it disabled rather than silently importing something
+                # that will dial out over the WAN on the next pass.
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{exc}. The tunnel was imported but left switched "
+                           f"off, so it has not contacted the provider.")
+            tunnel.via = normalise_slug(via)
+            tunnel.enabled = True
+            db.update_tunnel(tunnel)
+            chained = True
+
+        db.log_event("info", tunnel.slug,
+                     f"imported ({detected})"
+                     + (f", routed through {tunnel.via} from the first packet"
+                        if chained else ""))
         touched()
         return {"slug": tunnel.slug, "iface": tunnel.iface,
-                "endpoints": addrs, "unresolved": names}
+                "endpoints": addrs, "unresolved": names,
+                "via": tunnel.via}
 
     @app.patch("/api/tunnels/{slug}")
     def patch_tunnel(slug: str, body: dict = Body(...),

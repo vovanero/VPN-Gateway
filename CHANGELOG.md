@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.1.0 — a tunnel can be chained from its first packet
+
+Asked by a user setting up a second provider for a double VPN: how do I
+make sure the new provider never sees my real address, not even once?
+
+The honest answer was that they could not, from the panel. An imported
+tunnel was enabled immediately, so the reconcile loop's next pass sent a
+handshake over the uplink and the new provider's relay logged the WAN
+address before anything could be chained. Chaining afterwards does not
+take that record back.
+
+- **Import takes a parent.** The tunnel is created disabled, chained, and
+  only then enabled — inside the one request, where no reconcile pass can
+  observe the gap. Measured on the reference gateway with tcpdump: **zero
+  packets** to the new provider on the uplink, at import and at rest.
+- **A refused chain leaves the tunnel switched off**, rather than falling
+  back to an unchained live tunnel — which would be the same leak with
+  extra steps. The error says so.
+- The import dialog offers "Route through", so the safe order is also the
+  default one; `POST /api/tunnels/import` takes `via`.
+
+Still true, and worth saying plainly: this hides your *network location*
+from the exit provider, not your identity. The account number already
+identifies you, and a chain only means something across two different
+providers. Provisioning a tunnel through a provider's own API still
+contacts that API from the uplink — import a config file obtained
+elsewhere if that matters.
+
 ## 2.0.2
 
 Reported by a user who could not get out of a corner the panel had put
