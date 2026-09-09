@@ -464,6 +464,8 @@ function renderDashboard(host) {
 
   add(host, [
     hero,
+    networkStrip(s),
+    s.wan && s.wan.iface ? interfaceCards(s) : null,
     tiles,
     el("div", { class: "section-title" }, "Traffic"),
     throughput,
@@ -486,6 +488,226 @@ function renderDashboard(host) {
       : el("div", { class: "card" }, emptyState("tunnel", "No tunnels",
           "Start with 'Add tunnel' in the top right.")),
   ]);
+}
+
+/* ── the network at a glance ───────────────────────────────────────────────
+ *
+ * A drawing, not a row of cards. The question this answers - "is this thing
+ * connected, and if not where does it stop" - is about a path, and a path is
+ * worth drawing: the tunnel is visibly the segment between the gateway and
+ * the internet, the clients hang off the other side, and a break is a gap in
+ * the line rather than a word in a table.
+ *
+ * One SVG on a 900x196 grid, scaled by its viewBox. The daemon decides which
+ * link is broken (wanhealth.py); this only draws the verdict, so the picture
+ * and the CLI cannot disagree.
+ */
+
+const CHAIN_ORDER = ["carrier", "address", "gateway", "internet", "dns"];
+
+/** What to call each link in a sentence. The daemon's field names are for
+ *  the daemon; "the carrier link is down" is not how anyone says "the cable
+ *  is out". */
+const LINK_LABEL = {
+  carrier: "cable", address: "uplink address", gateway: "upstream router",
+  internet: "internet", dns: "DNS",
+};
+
+/** A line between two points, styled by what is flowing through it. */
+function wire(x1, y1, x2, y2, state, dashed) {
+  const stroke = state === "down" ? "var(--danger)"
+    : state === "up" ? "var(--ok)" : "var(--border-2)";
+  const line = svg("path", {
+    d: `M ${x1} ${y1} L ${x2} ${y2}`,
+    fill: "none", stroke, "stroke-width": state === "up" ? 2 : 1.6,
+    "stroke-linecap": "round",
+  });
+  if (dashed || state !== "up") line.setAttribute("stroke-dasharray", "5 5");
+  if (state === "up") line.setAttribute("class", "wire-live");
+  return line;
+}
+
+/** A caption above or below a wire. */
+function wireLabel(x, y, text, cls) {
+  return svg("text", {
+    x, y, "text-anchor": "middle", class: "topo-label " + (cls || ""),
+  }, document.createTextNode(text));
+}
+
+function topoIcon(href, x, y, size) {
+  const u = document.createElementNS(NS, "use");
+  u.setAttribute("href", href);
+  u.setAttribute("x", x);
+  u.setAttribute("y", y);
+  u.setAttribute("width", size);
+  u.setAttribute("height", size);
+  return u;
+}
+
+function networkDrawing(s) {
+  const w = s.wan, t = s.totals;
+  const broken = w.first_broken;
+  const upOk = !broken;                       // the uplink half is sound
+  const exit = (s.tunnels.find((x) => x.state === "up" && x.exit_ip) || {});
+  const tunnelState = !t.tunnels_total ? "idle"
+    : t.tunnels_up ? "up" : "down";
+
+  // Geometry. Left to right: internet, the tunnel segment, this gateway,
+  // the client segment, the clients.
+  const Y = 86;
+  const g = svg("g", {});
+
+  // ── wires ───────────────────────────────────────────────────────────
+  g.append(
+    wire(96, Y, 152, Y, upOk ? (tunnelState === "up" ? "up" : "idle") : "down"),
+    wire(292, Y, 336, Y, upOk ? (tunnelState === "up" ? "up" : "idle") : "down"),
+    wire(592, Y, 742, Y, t.clients_online ? "up" : "idle"),
+  );
+
+  g.append(wireLabel(667, Y - 12, "LAN", "dim"));
+
+  // ── internet ────────────────────────────────────────────────────────
+  g.append(
+    svg("circle", { cx: 56, cy: Y, r: 32,
+      fill: upOk ? "var(--ok-soft)" : "var(--danger-soft)",
+      stroke: upOk ? "var(--ok)" : "var(--danger)", "stroke-width": 1.5 }),
+    topoIcon("#i-globe", 41, Y - 15, 30),
+    wireLabel(56, Y + 52, "Internet"),
+    wireLabel(56, Y + 68,
+      upOk && w.rtt_ms ? `${Math.round(w.rtt_ms)} ms`
+        : upOk ? "reachable" : "unreachable", "dim"),
+  );
+
+  // ── the tunnel that segment runs through ────────────────────────────
+  const tunnelFill = tunnelState === "up" ? "var(--ok-soft)"
+    : tunnelState === "down" ? "var(--danger-soft)" : "var(--surface-2)";
+  const tunnelEdge = tunnelState === "up" ? "var(--ok)"
+    : tunnelState === "down" ? "var(--danger)" : "var(--border-2)";
+  g.append(
+    svg("rect", { x: 152, y: Y - 22, width: 140, height: 44, rx: 22,
+      fill: tunnelFill, stroke: tunnelEdge, "stroke-width": 1.5 }),
+    svg("text", { x: 222, y: Y + 5, "text-anchor": "middle",
+      class: "topo-node" },
+      document.createTextNode(
+        t.tunnels_total ? `${t.tunnels_up}/${t.tunnels_total} tunnel`
+                          + (t.tunnels_total > 1 ? "s" : "") : "no tunnel")),
+    wireLabel(222, Y - 33, exit.exit_ip ? "exit " + exit.exit_ip : "", "mono dim"),
+    wireLabel(222, Y + 44,
+      upOk ? `${w.iface} ${(w.addresses || [])[0] || ""}` : "uplink down",
+      "mono dim"),
+  );
+
+  // ── the gateway itself ──────────────────────────────────────────────
+  g.append(
+    svg("rect", { x: 336, y: Y - 44, width: 256, height: 88, rx: 14,
+      fill: "var(--surface)", stroke: "var(--accent)", "stroke-width": 1.6 }),
+    topoIcon("#i-shield", 356, Y - 27, 26),
+    svg("text", { x: 392, y: Y - 8, class: "topo-node" },
+      document.createTextNode("VPN Gateway")),
+    svg("text", { x: 392, y: Y + 9, class: "topo-label dim" },
+      document.createTextNode(
+        `kill switch armed \u00b7 ${(s.killswitch.leaked_packets || 0).toLocaleString()} blocked`)),
+    svg("text", { x: 356, y: Y + 32, class: "topo-label mono dim" },
+      document.createTextNode(s.system.lan_cidr)),
+  );
+
+  // ── clients ─────────────────────────────────────────────────────────
+  const clientTone = t.clients_blocked ? "var(--warn)"
+    : t.clients_online ? "var(--ok)" : "var(--border-2)";
+  g.append(
+    svg("rect", { x: 742, y: Y - 34, width: 92, height: 68, rx: 14,
+      fill: "var(--surface-2)", stroke: clientTone, "stroke-width": 1.5 }),
+    topoIcon("#i-clients", 775, Y - 24, 26),
+    svg("text", { x: 788, y: Y + 22, "text-anchor": "middle",
+      class: "topo-node" },
+      document.createTextNode(String(t.clients_online))),
+    wireLabel(788, Y + 52, t.clients_total === 1 ? "client" : "clients"),
+    wireLabel(788, Y + 68,
+      t.clients_blocked ? `${t.clients_blocked} blocked` : "all assigned",
+      "dim"),
+  );
+
+  const box = svg("svg", {
+    class: "topo", viewBox: "0 0 880 164",
+    preserveAspectRatio: "xMidYMid meet",
+  });
+  box.append(g);
+  return box;
+}
+
+/** One labelled row inside an interface card. */
+function ifaceRow(label, value, tone) {
+  return [
+    el("dt", {}, label),
+    el("dd", { class: "mono" + (tone ? " " + tone : "") }, value || "—"),
+  ];
+}
+
+/** The uplink and the client network, side by side, with their numbers. */
+function interfaceCards(s) {
+  const w = s.wan, net = s.network_summary || {};
+  const t = s.totals;
+  const broken = w.first_broken;
+  const uplinkOk = !broken;
+
+  const uplink = el("div", { class: "card" },
+    el("div", { class: "card-head" },
+      el("div", { class: "row", style: "gap:9px" },
+        pill(uplinkOk ? "up" : "down", uplinkOk ? "up" : "down"),
+        el("h3", {}, "Uplink"),
+        el("span", { class: "mode-tag" }, "WAN")),
+      el("button", { class: "btn sm", onclick: () => go("settings") },
+        icon("sliders"), "Configure")),
+    el("div", { class: "card-body" },
+      el("dl", { class: "kv" },
+        ...ifaceRow("Interface", w.iface),
+        ...ifaceRow("Protocol", net.wan_mode === "static" ? "Static IP"
+                                                         : "Automatic (DHCP)"),
+        ...ifaceRow("IP address", (w.addresses || [])[0]),
+        ...ifaceRow("Gateway", w.gateway),
+        ...ifaceRow("DNS", (net.dns || []).join(", ")),
+        ...ifaceRow("Latency", w.rtt_ms ? `${Math.round(w.rtt_ms)} ms` : "—"))));
+
+  const lanTone = t.clients_blocked ? "warn" : t.clients_online ? "up" : "unknown";
+  const lan = el("div", { class: "card" },
+    el("div", { class: "card-head" },
+      el("div", { class: "row", style: "gap:9px" },
+        pill(lanTone, t.clients_online ? "up" : "idle"),
+        el("h3", {}, "Client network"),
+        el("span", { class: "mode-tag" }, "LAN")),
+      el("button", { class: "btn sm", onclick: () => go("clients") },
+        icon("clients"), "Clients")),
+    el("div", { class: "card-body" },
+      el("dl", { class: "kv" },
+        ...ifaceRow("Interface", s.system.lan_bridge || "br-lan"),
+        ...ifaceRow("Network", s.system.lan_cidr),
+        ...ifaceRow("Gateway address", s.system.lan_gateway),
+        ...ifaceRow("DHCP", net.dhcp_enabled ? "Serving" : "Off"),
+        ...ifaceRow("Registered", `${t.clients_total}`),
+        ...ifaceRow("Blocked",
+          t.clients_blocked ? `${t.clients_blocked}` : "none",
+          t.clients_blocked ? "warn-text" : ""))));
+
+  return el("div", { class: "grid g2", style: "margin-bottom:18px" },
+    uplink, lan);
+}
+
+function networkStrip(s) {
+  const w = s.wan;
+  if (!w || !w.iface) return null;      // pre-2.2 daemon, or no uplink configured
+
+  const broken = w.first_broken;
+  return el("div", { class: "card topo-card" },
+    networkDrawing(s),
+    // One sentence, and only when something is wrong. A banner that is
+    // always there is one nobody reads.
+    broken
+      ? el("div", { class: "row topo-alert" },
+          icon("alert"),
+          el("div", {},
+            el("b", {}, `No ${LINK_LABEL[broken] || broken}. `),
+            el("span", {}, w.explain)))
+      : null);
 }
 
 function statTile(label, value, foot, tone, ic) {

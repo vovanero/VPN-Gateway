@@ -540,6 +540,36 @@ input:user-invalid, select:user-invalid { border-color: var(--danger); }
   border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent);
 }
 
+/* ── the network drawing ───────────────────────────────────────────────
+ *
+ * One SVG scaled by its viewBox, so the layout holds at any width without a
+ * second set of rules. Text is part of the drawing and scales with it; at
+ * the page's own width that lands near 1:1.
+ */
+.topo-card { margin-bottom: 18px; padding: 6px 4px 2px; }
+.topo { display: block; width: 100%; height: auto; }
+.topo use { fill: none; stroke: currentColor; stroke-width: 1.8;
+            stroke-linecap: round; stroke-linejoin: round;
+            color: var(--text-2); }
+.topo-node  { font-size: 13px; font-weight: 600; fill: var(--text); }
+.topo-label { font-size: 11px; fill: var(--text-2); }
+.topo-label.dim { fill: var(--text-3); }
+.topo-label.mono, .topo-node.mono { font-family: var(--mono); }
+
+/* Traffic is moving: let the wire show it. Slow enough to read as flow
+   rather than decoration, and off entirely for anyone who asked for less
+   motion. */
+.topo .wire-live { stroke-dasharray: 5 5; animation: wire-flow 1.1s linear infinite; }
+@keyframes wire-flow { to { stroke-dashoffset: -20; } }
+@media (prefers-reduced-motion: reduce) {
+  .topo .wire-live { animation: none; stroke-dasharray: none; }
+}
+
+.topo-alert {
+  gap: 9px; align-items: flex-start; padding: 2px 16px 14px;
+  font-size: 12.5px; color: var(--danger);
+}
+
 /* ── double VPN chains ─────────────────────────────────────────────────
  *
  * Drawn as a path because that is what a chain is. Hop state reuses the

@@ -338,10 +338,23 @@ class Service:
                 "tx_rate": sum(t["tx_rate"] for t in tunnel_rows
                                if not t["via"]),
             },
+            # The uplink, measured link by link. The panel draws it as a
+            # path and colours the first break; see wanhealth.CHAIN.
+            "wan": self.reconciler.wan.state.to_dict(),
+            # The handful of settings the overview's interface cards show.
+            # Not the whole config - that is /api/network, which the settings
+            # page fetches on demand - just enough to answer "what is it set
+            # to" without a second request on the page people leave open.
+            "network_summary": {
+                "wan_mode": self.settings.wan.mode,
+                "dns": list(self.settings.dns.bootstrap),
+                "dhcp_enabled": self.settings.dhcp.enabled,
+            },
             "system": {
                 "version": __import__("vpngw").__version__,
                 "uptime": time.time() - self.started_at,
                 "lan_cidr": net.lan_cidr,
+                "lan_bridge": net.lan_bridge,
                 "lan_gateway": str(net.lan_address),
                 "wan_iface": net.wan_iface,
                 "mgmt_iface": net.mgmt_iface,

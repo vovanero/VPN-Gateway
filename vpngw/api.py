@@ -534,7 +534,11 @@ def create_app(service) -> FastAPI:
             "stack": netapply.stack(),
             "rollback_pending": netapply.rollback_pending(),
             "rollback_seconds": netapply.rollback_seconds_left(),
-            "live": netapply.verify(settings.wan.gateway),
+            # The same measurement the dashboard draws. This used to call
+            # apply.verify(), which pings settings.wan.gateway - empty on a
+            # DHCP uplink, so it reported "unknown" on exactly the boxes it
+            # was meant to reassure.
+            "live": service.reconciler.wan.state.to_dict(),
         }
 
     @app.post("/api/network/wan/apply")

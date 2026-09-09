@@ -121,6 +121,16 @@ def main(argv: list[str]) -> int:
 
     failed = False
     for path in paths:
+        # A truncated file balances trivially. Saying "brackets balanced" to
+        # an empty app.js is how a destroyed panel ships: the check ran, it
+        # passed, and nobody looked. It happened - a bad write emptied the
+        # file and this reported success on nothing.
+        size = path.stat().st_size if path.exists() else 0
+        if size < 2000:
+            print(f"{path}: {size} bytes - truncated or missing", file=sys.stderr)
+            failed = True
+            continue
+
         problems = check(path)
         if problems:
             failed = True

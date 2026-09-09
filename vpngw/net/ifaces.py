@@ -30,6 +30,23 @@ def mtu_of(name: str) -> int:
         return 0
 
 
+def carrier_of(name: str) -> bool | None:
+    """Is a cable actually plugged in - as distinct from the link being up.
+
+    `is_up()` reads the administrative IFF_UP flag, which stays set when the
+    cable is pulled: the operator asked for the interface to be up and it
+    still is, it just has nothing to talk to. For a panel that claims to say
+    whether the box is connected, that distinction is the whole point.
+
+    None when the kernel will not answer, which it does not for a link that
+    is administratively down - there is no carrier to report either way.
+    """
+    try:
+        return Path(f"/sys/class/net/{name}/carrier").read_text().strip() == "1"
+    except OSError:
+        return None
+
+
 def exists(iface: str) -> bool:
     return try_run(["ip", "link", "show", "dev", iface]).ok
 

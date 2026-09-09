@@ -242,7 +242,7 @@ regardless.
 
 | Page | What it is for |
 |---|---|
-| **Overview** | Kill-switch state, throughput graph, and a list of anything that needs attention — a pool with no healthy member, an unassigned client, a tunnel that dropped |
+| **Overview** | The network drawn as a path — internet, tunnel, gateway, clients — with the uplink measured link by link and the first break named; kill-switch state, uplink and client-network cards, throughput, and anything that needs attention |
 | **Tunnels** | Every tunnel with live latency, exit IP, throughput and a sparkline; click one for a detail drawer with graphs, endpoints and DNS |
 | **Pools** | Failover chains drawn in priority order, with the currently active member highlighted |
 | **Clients** | Assign a machine's exit from a dropdown, in place; multi-select for bulk reassignment |

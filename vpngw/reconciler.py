@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from . import config, dnsmgr
 from .db import Database
 from .discovery import Discovery
+from .wanhealth import WanMonitor
 from .health import HealthMonitor
 from .models import Egress, EgressKind, HealthState, Pool, Tunnel, TunnelKind
 from .net import ifaces, nft, routing
@@ -64,6 +65,7 @@ class Reconciler:
         #: of the device - trusting the database would skip the very re-apply
         #: that closes that gap.
         self._applied_via: dict[str, str] = {}
+        self.wan = WanMonitor(settings)
         # Tunnels the reconcile loop must leave alone. Used by the leak test:
         # without it, taking a tunnel down and measuring the result is a race
         # the loop wins - it restores the tunnel within its five-second timer
@@ -382,6 +384,14 @@ class Reconciler:
     # -- 4. health ----------------------------------------------------------
 
     def _step_health(self, tunnels: list[Tunnel]) -> None:
+        # The uplink first: a tunnel that is down because the cable is out is
+        # a different fault from one the provider dropped, and the panel can
+        # only say so if both were measured in the same pass.
+        try:
+            self.wan.probe()
+        except Exception as exc:          # never let a probe stop a reconcile
+            log.debug("wan probe failed: %s", exc)
+
         for t in tunnels:
             before = self.health.get(t.slug).state
             after = self.health.probe(t).state

@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.2.0 — the network, drawn
+
+Overview could say a great deal about tunnels and nothing about the network
+under them. On a fresh gateway it showed "Kill switch armed", four zeros and
+an empty chart — accurate, and no help at all with the question an operator
+actually opens the page to ask: is this thing connected?
+
+- **The uplink is measured, link by link.** `wanhealth.py` probes carrier,
+  address, upstream router, internet and DNS once per reconcile pass, with
+  the same hysteresis as tunnel health, and reports *which link is the first
+  to fail*. One green light would have to pick a meaning among several that
+  come apart in practice, and be wrong the rest of the time.
+- **A downstream success vouches for an upstream probe.** Found by running
+  it: the reference gateway's own router drops ICMP addressed to itself while
+  forwarding perfectly, so the first version reported a broken uplink on a
+  box whose internet demonstrably worked. Traffic that arrives outranks a
+  ping that does not — but only reachability probes may vouch, because a
+  static address survives the cable being pulled and must not be allowed to
+  prove the cable.
+- **Overview opens with a drawing**: internet, the tunnel the traffic runs
+  through, this gateway, and the clients — with live wires that animate while
+  traffic moves, the exit address above the tunnel, and one sentence naming
+  the break when there is one. Below it, uplink and client-network cards
+  carrying protocol, address, gateway, DNS and client counts.
+- No new fetch: the measurement rides the snapshot the panel already polls.
+  `GET /api/network/wan`, written long ago and called by nothing, now serves
+  the same record instead of a check that reported "unknown" forever on a
+  DHCP uplink.
+- `check_js.py` refuses a file under 2 KB. It called a truncated `app.js`
+  "brackets balanced" — which is how a destroyed panel ships: the check ran,
+  it passed, and nobody looked.
+
 ## 2.1.0 — a tunnel can be chained from its first packet
 
 Asked by a user setting up a second provider for a double VPN: how do I

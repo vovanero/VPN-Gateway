@@ -20,6 +20,7 @@ being alive.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -32,6 +33,27 @@ log = logging.getLogger("vpngw.routing")
 # ---------------------------------------------------------------------------
 # routing tables
 # ---------------------------------------------------------------------------
+
+
+def default_gateway() -> tuple[str, str]:
+    """The main table's default route, as (gateway address, device).
+
+    Returned as two values on purpose. ``apply.verify()`` flattens them into
+    one string - the gateway if there is one, the device otherwise - which
+    leaves the caller unable to tell which it got, and unable to ping the
+    one that matters. Reading the kernel rather than the settings is what
+    makes this work on a DHCP uplink, where ``wan.gateway`` is empty.
+
+    ("", "") when there is no default route at all.
+    """
+    res = try_run(["ip", "-json", "route", "show", "default"])
+    try:
+        routes = json.loads(res.stdout or "[]")
+    except ValueError:
+        return "", ""
+    for route in routes:
+        return route.get("gateway", "") or "", route.get("dev", "") or ""
+    return "", ""
 
 
 def set_link_mtu(iface: str, mtu: int) -> None:
