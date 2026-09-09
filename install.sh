@@ -260,8 +260,10 @@ fi
 # PATH or a half-removed package is caught here rather than three steps later
 # with an error that points at the wrong thing.
 for tool in nft ip wg sysctl systemctl dnsmasq; do
-    command -v "$tool" >/dev/null 2>&1         || die "$tool is installed but not on PATH ($PATH). If you became root
-       with 'su', try 'su -' instead, or re-run as: PATH=/usr/sbin:/sbin:\$PATH $0"
+    command -v "$tool" >/dev/null 2>&1 && continue
+    die "$tool is installed but not on PATH.
+       If you became root with 'su', use 'su -' instead - plain 'su' keeps
+       the calling user's PATH, which has no /usr/sbin."
 done
 ok "every required tool is reachable"
 
