@@ -158,8 +158,11 @@ On the VM:
 ```bash
 git clone https://github.com/vovanero/VPN-Gateway.git
 cd VPN-Gateway
-sudo ./install.sh
+sudo ./install.sh          # already root, as a fresh Debian often is? drop the sudo
 ```
+
+A minimal Debian install has no `sudo` at all — if you are logged in as
+root, run `./install.sh` on its own.
 
 The installer detects which adapter is which, then walks through a short
 wizard — uplink address (static or DHCP), client network, whether management
