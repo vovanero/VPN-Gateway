@@ -1,5 +1,23 @@
 # Changelog
 
+## 2.4.1 - do not install 2.4.0
+
+`vpngw/__init__.py` shipped empty in 2.4.0. An empty module imports fine and
+fails at the first attribute, so every test passed and the daemon crashed on
+its first `/api/status` with `module 'vpngw' has no attribute '__version__'`.
+
+Caught in production by the thing built for it: `vpngw-update` saw the new
+daemon fail to answer, restored 2.2.0 and said so. Nothing was lost.
+
+The test suite now checks the bytes rather than only the parse - no shipped
+`.py`, `.js`, `.css` or `.html` file may be zero-length, `__version__` must
+exist, and it must match the newest heading in this file. That last one also
+stops a stale version number making an up-to-date box offer to update forever.
+
+This is the second time a bad edit has written a file to zero bytes and the
+tests have shrugged (`app.js`, in 2.2.0). It is now the kind of mistake that
+fails loudly.
+
 ## 2.4.0 - NordVPN asks for a token, and the updater installs itself
 
 **NordVPN takes an access token now.** The old field wanted a WireGuard

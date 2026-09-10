@@ -672,5 +672,47 @@ class TestDatabase(unittest.TestCase):
         self.assertEqual(len(self.db.events(limit=5)), 5)
 
 
+class ShippedSourceIsIntact(unittest.TestCase):
+    """A truncated file is not a syntax error, it is a working import of nothing.
+
+    This has now bitten twice: app.js was written to zero bytes by a bad
+    edit and the bracket checker declared it balanced; vpngw/__init__.py went
+    the same way and every test still passed, because nothing here reads
+    __version__ - until the daemon did, in production, and the updater rolled
+    the release back. An empty module imports cleanly and fails at the first
+    attribute. So check the bytes, not just the parse.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def test_no_shipped_file_is_empty(self):
+        empty = [p for p in (self.ROOT / "vpngw").rglob("*")
+                 if p.is_file() and p.suffix in (".py", ".js", ".css", ".html")
+                 and "__pycache__" not in p.parts
+                 and p.stat().st_size == 0]
+        self.assertEqual(empty, [], "these files are zero bytes")
+
+    def test_the_package_reports_a_version(self):
+        import vpngw
+        self.assertRegex(vpngw.__version__, r"^\d+\.\d+\.\d+$")
+
+    def test_the_version_matches_the_changelog(self):
+        """The number in the code is the number the release notes describe.
+
+        The updater compares this against the newest tag on GitHub, so a
+        stale __version__ makes an up-to-date box offer to update forever.
+        """
+        import re
+        import vpngw
+        text = (self.ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        newest = re.search(r"^## (\d+\.\d+\.\d+)", text, re.M)
+        self.assertIsNotNone(newest, "no version heading in CHANGELOG.md")
+        self.assertEqual(vpngw.__version__, newest.group(1))
+
+    def test_the_snapshot_can_read_the_version(self):
+        """service.snapshot() reaches for it by name; prove the name is there."""
+        self.assertTrue(hasattr(__import__("vpngw"), "__version__"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
