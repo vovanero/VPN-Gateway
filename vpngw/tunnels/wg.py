@@ -29,6 +29,12 @@ log = logging.getLogger("vpngw.wg")
 DEFAULT_MTU = 1420
 
 
+#: Sent when a config does not name one. 25 seconds is what every
+#: provider that ships the line uses, and it is short enough to hold a
+#: NAT binding open on the way out.
+DEFAULT_KEEPALIVE = 25
+
+
 class WireGuardDriver(TunnelDriver):
     kind = TunnelKind.WIREGUARD
 
@@ -65,8 +71,21 @@ class WireGuardDriver(TunnelDriver):
                 lines.append(f"Endpoint = {peer['endpoint']}")
             allowed = peer.get("allowed_ips") or ["0.0.0.0/0"]
             lines.append("AllowedIPs = " + ", ".join(allowed))
-            if peer.get("keepalive"):
-                lines.append(f"PersistentKeepalive = {peer['keepalive']}")
+            # Always send one. A client tunnel with no keepalive cannot
+            # bootstrap on a gateway that fails closed: WireGuard only
+            # handshakes when it has something to send, and nothing has
+            # anything to send until the tunnel is healthy - the egress table
+            # holds a blackhole until then, so the health probe cannot get out
+            # to create the traffic that would complete the handshake. The
+            # tunnel sits there, interface up, peer configured, zero bytes
+            # transferred, forever.
+            #
+            # Providers whose configs carry PersistentKeepalive hide this
+            # entirely, which is why it went unnoticed: every tunnel imported
+            # from Mullvad or NordVPN has the line. A hand-written config, or
+            # one from a provider that leaves it out, does not.
+            lines.append("PersistentKeepalive = "
+                         f"{peer.get('keepalive') or DEFAULT_KEEPALIVE}")
 
         config.WG_RUNTIME.mkdir(parents=True, exist_ok=True)
         os.chmod(config.WG_RUNTIME, stat.S_IRWXU)

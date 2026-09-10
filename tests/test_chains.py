@@ -176,7 +176,7 @@ class TestOuterMark(unittest.TestCase):
 
 
 class TestWireguardFwmark(unittest.TestCase):
-    def _setconf(self, tunnel):
+    def _setconf(self, tunnel, spec=None):
         from vpngw.tunnels.wg import WireGuardDriver
         import vpngw.tunnels.wg as wgmod
 
@@ -187,7 +187,7 @@ class TestWireguardFwmark(unittest.TestCase):
         self.addCleanup(lambda: setattr(config, "WG_RUNTIME", saved))
 
         drv = WireGuardDriver()
-        path = drv._write_setconf(tunnel, {
+        path = drv._write_setconf(tunnel, spec or {
             "private_key": "k" * 43 + "=",
             "peers": [{"public_key": "p" * 43 + "=",
                        "endpoint": "1.2.3.4:51820"}],
@@ -204,6 +204,43 @@ class TestWireguardFwmark(unittest.TestCase):
         """setconf replaces the whole device config, so the absent line is
         also what *clears* the mark when a chain is dissolved."""
         self.assertNotIn("FwMark", self._setconf(wg("aa01", 1)))
+
+
+class TestKeepaliveIsAlwaysSent(TestWireguardFwmark):
+    """A client tunnel without one cannot come up on this box.
+
+    Found on a live gateway: a hand-written config with no
+    PersistentKeepalive line produced an interface that was up, a peer that
+    was configured, and zero bytes transferred - forever. WireGuard only
+    handshakes when it has something to send; nothing has anything to send
+    until the tunnel is healthy; the egress table holds a blackhole until
+    then, so the health probe cannot get out to make the traffic that would
+    complete the handshake.
+
+    Every provider config we had shipped the line, which is exactly why this
+    survived so long.
+    """
+
+    def _peer(self, **extra):
+        return {"private_key": "k" * 43 + "=",
+                "peers": [dict({"public_key": "p" * 43 + "=",
+                                "endpoint": "1.2.3.4:51820"}, **extra)]}
+
+    def test_a_config_without_one_still_gets_a_keepalive(self):
+        from vpngw.tunnels.wg import DEFAULT_KEEPALIVE
+        text = self._setconf(wg("aa01", 1), self._peer())
+        self.assertIn(f"PersistentKeepalive = {DEFAULT_KEEPALIVE}", text)
+
+    def test_zero_is_treated_as_absent(self):
+        """0 is what the importer stores when the line was missing."""
+        from vpngw.tunnels.wg import DEFAULT_KEEPALIVE
+        text = self._setconf(wg("aa01", 1), self._peer(keepalive=0))
+        self.assertIn(f"PersistentKeepalive = {DEFAULT_KEEPALIVE}", text)
+
+    def test_the_provider_s_own_value_wins(self):
+        text = self._setconf(wg("aa01", 1), self._peer(keepalive=15))
+        self.assertIn("PersistentKeepalive = 15", text)
+        self.assertNotIn("PersistentKeepalive = 25", text)
 
 
 class TestOpenvpnMark(unittest.TestCase):

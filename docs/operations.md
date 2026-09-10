@@ -267,9 +267,62 @@ means the endpoint address is not in the allowlist. `vpngwctl check` names it.
 `vpngwctl tunnel set nl01 --mtu 1380`. WireGuard defaults to 1420, which is
 often too large once Hyper-V and a provider's own encapsulation are stacked.
 
-**The web UI is unreachable.** It is bound to the management interface only.
-From the Windows host, confirm `10.20.0.2` is on `vEthernet (vpngw-mgmt)` and
-that `ping 10.20.0.1` answers.
+**The panel is unreachable.** It listens on every address; the firewall
+decides who may reach it. `admin_ifaces` in `[net]` is the list of interfaces
+whose traffic is let through to port 8080 and 22 - a property of which side of
+the box you are on, not of your source address.
+
+```bash
+grep admin_ifaces /etc/vpngw/vpngw.toml
+nft list chain inet vpngw input | grep 8080
+ss -tlnp | grep 8080
+```
+
+The default is the client bridge alone. `install.sh` adds the uplink as well
+when the uplink is on a private network, which is the usual lab case and is
+almost always where you are during setup - so on a machine reached over its
+uplink, expect to see both:
+
+```
+iifname "br-lan" tcp dport { 22, 8080 } accept
+iifname "eth0"   tcp dport { 22, 8080 } accept
+```
+
+If the uplink is missing from that list, add it to `admin_ifaces` and restart.
+Nothing here exposes the panel to the internet on its own: on a routable
+uplink, `install.sh` leaves the uplink out.
+
+**Something on the gateway itself hangs reaching the internet - `apt`, most
+often.** This is the kill switch, working. The gateway's *own* egress is
+dropped by default: it may reach VPN endpoints, the bootstrap resolvers,
+provider APIs on 443, NTP and ICMP, and nothing else. A dropped SYN is not a
+refusal - it is retried until it times out - so being blocked looks exactly
+like being slow, which is why this one costs people an afternoon.
+
+```bash
+nft list counter inet vpngw host_egress_drop
+```
+
+A counter climbing while the command sits there is the answer. If you
+genuinely need the box to fetch something, open a window rather than editing
+rules by hand:
+
+```bash
+vpngwctl maintenance on --minutes 10
+```
+
+Updating does not need one. `install.sh` calls apt only when a package is
+actually absent, and on a provisioned gateway nothing is.
+
+**Updating a gateway that has no tunnel of its own.** `vpngw-update` refuses
+to fetch over the uplink, by design, so a gateway with no tunnel cannot use
+it. Carry the tree over and run the installer instead - that is the same
+update, minus the automatic rollback:
+
+```bash
+scp -r VPN-Gateway root@<gateway>:/root/
+ssh root@<gateway> VPNGW_NONINTERACTIVE=1 bash /root/VPN-Gateway/install.sh
+```
 
 **Something is deeply wrong and you want to see the actual rules.**
 

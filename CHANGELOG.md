@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.4.3 - a custom config without PersistentKeepalive could never come up
+
+Import a hand-written WireGuard config with no `PersistentKeepalive` line and
+you got an interface that was up, a peer that was configured, and zero bytes
+transferred. Forever. No error, nothing in the log, `no handshake yet` in
+`status` and no way to tell why.
+
+It is a deadlock, and this gateway's own design closes it:
+
+- WireGuard only handshakes when it has something to send.
+- Nothing has anything to send until the tunnel is healthy.
+- Health is measured by a probe *through* the tunnel.
+- Until the tunnel is healthy its egress table holds a blackhole, by
+  design - that is the kill switch - so the probe cannot get out.
+
+The keepalive is the one thing that breaks the circle, and every provider
+config we had shipped one, which is exactly why this survived four releases.
+Mullvad, NordVPN, IVPN - all carry the line. A config written by hand, or by
+a provider that leaves it out, does not.
+
+`PersistentKeepalive` is now always sent, defaulting to 25 seconds when the
+config does not name one; a config that *does* name one still wins. Existing
+tunnels are fixed by the next render - no re-import.
+
+Diagnosed on a live gateway: adding the keepalive by hand completed the
+handshake in 11 seconds on a tunnel that had been down since import.
+
+Also in this release, from the same session:
+
+- `docs/operations.md` said the panel "is bound to the management interface
+  only" and pointed at a host address from the three-adapter lab. It has not
+  worked that way for some time: the panel listens everywhere and
+  `admin_ifaces` decides who gets through. Rewritten, with the commands to
+  check it.
+- Two new troubleshooting entries for symptoms that read as hangs rather than
+  failures: anything on the gateway reaching the internet (it is the kill
+  switch; `vpngwctl maintenance` is the escape hatch), and updating a gateway
+  that has no tunnel of its own.
+
 ## 2.4.2 - the installer stops asking apt for a package that does not exist
 
 Two bugs a second machine found. Neither failed anything; both wasted an
