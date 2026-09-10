@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.3.0 — updating, without phoning home
+
+`scripts/update.sh` fetches a new version **through a tunnel** and refuses to
+run without one.
+
+A panel button that polls GitHub was the obvious design and the wrong one: a
+privacy gateway that reaches out on a timer tells whoever is watching that
+this address runs a VPN gateway and which version, which is the sort of thing
+the box exists to prevent. Updating is something the operator runs, not
+something the box does.
+
+- Both the name lookup and the download go through a tunnel's own resolver
+  and interface, so GitHub sees the VPN exit rather than the uplink.
+  Measured: zero packets to GitHub on the uplink during a fetch.
+- **No firewall change.** The output chain already permits
+  `oifname @tun_ifaces accept` — traffic leaving through a tunnel is safe
+  because it is encrypted — so a gateway that never updates has no hole
+  waiting to be used.
+- The running tree is copied aside and a rollback timer armed *before*
+  anything is replaced, the same commit-confirm shape as an uplink change.
+  If the new daemon does not answer, the old one comes back by itself;
+  `--rollback` does it on demand.
+- Verified on the reference gateway by downgrading 2.2.0 → 2.1.0 and back:
+  tunnels stayed up, client assignments, settings and the panel password all
+  survived both directions.
+- `--check` reports installed and available and changes nothing.
+
 ## 2.2.0 — the network, drawn
 
 Overview could say a great deal about tunnels and nothing about the network

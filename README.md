@@ -364,6 +364,31 @@ before relying on this. In short: it cannot help a client VM that has a second
 network adapter on an External switch, and it does not defend the Hyper-V host
 itself. Both are configuration discipline, not something a gateway can enforce.
 
+## Updating
+
+```bash
+sudo scripts/update.sh --check     # what is installed, what is available
+sudo scripts/update.sh             # fetch the newest tag and install it
+sudo scripts/update.sh --rollback  # put the previous version back
+```
+
+It fetches **through a tunnel**, never over the uplink, and refuses to run if
+no tunnel is up. Asking GitHub for a new version of this software over the
+uplink would tell an ISP that this address runs a VPN gateway and which
+version — the sort of thing the box exists to prevent. Both the name lookup
+and the download go through a tunnel's own resolver and interface, so the
+only address GitHub sees is the VPN exit.
+
+That needs no firewall change: the output chain already permits traffic
+leaving through a tunnel, because it is encrypted. A gateway that has never
+been updated therefore has no hole waiting to be used, and there is no
+periodic check phoning home — updating is something you run.
+
+The current version is copied aside and a rollback timer armed before
+anything is replaced. If the new daemon does not answer, the old one returns
+by itself. Tunnels, clients, settings and the panel password are kept; the
+only interruption is the daemon restart.
+
 ## Distributing an image
 
 `scripts/prepare-image.sh` strips a working gateway back to something safe to
