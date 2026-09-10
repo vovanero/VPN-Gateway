@@ -21,12 +21,18 @@ from pathlib import Path
 
 from .. import config
 from ..models import Tunnel, TunnelKind
+from ..net import ifaces
 from ..net.shell import CommandError, run, try_run
 from .base import LinkInfo, TunnelDriver, link_exists, link_state
 
 log = logging.getLogger("vpngw.wg")
 
 DEFAULT_MTU = 1420
+#: IPv4 + UDP + WireGuard headers carried by every encrypted packet.
+WG_OVERHEAD = 60
+#: Never derive below this. Anything smaller is almost certainly a misread
+#: parent rather than a real path, and IPv6 requires 1280 regardless.
+MIN_MTU = 1280
 
 
 #: Sent when a config does not name one. 25 seconds is what every
@@ -120,13 +126,54 @@ class WireGuardDriver(TunnelDriver):
                 continue  # IPv6 inside the tunnel is not wired up; see docs
             run(["ip", "addr", "add", addr, "dev", iface])
 
-        mtu = t.mtu or spec.get("mtu") or DEFAULT_MTU
+        mtu = t.mtu or spec.get("mtu") or self._auto_mtu(t)
         run(["ip", "link", "set", "mtu", str(mtu), "up", "dev", iface])
 
         info = link_state(iface)
         info.dns = spec.get("dns", [])
         log.info("wireguard %s up (mtu %s, addr %s)", iface, mtu, info.local_ip)
         return info
+
+    def _auto_mtu(self, t: Tunnel) -> int:
+        """The largest inner MTU that still fits what carries this tunnel.
+
+        Encrypted packets are 60 bytes larger than the plaintext inside them
+        and have to fit whatever they ride on: the uplink for an ordinary
+        tunnel, the parent tunnel for a chained one. A chained tunnel left at
+        the flat 1420 default is 1420 inside a 1380 parent - 100 bytes too
+        big - and the failure is the nastiest kind: the tunnel comes up, the
+        handshake completes, small packets work, and large ones vanish. What
+        an operator sees is a download that runs fine and an upload that dies,
+        with nothing in any log.
+
+        1420 stays the ceiling rather than becoming a starting point: on a
+        plain 1500-byte uplink the arithmetic would allow 1440, but paths lie
+        about their size often enough (PPPoE, tunnelled uplinks) that raising
+        the default for everyone to gain 20 bytes is a bad trade. This only
+        ever moves the MTU *down*, and only when something says it must.
+        """
+        carrier, path = self._carrier(t)
+        if path <= 0:
+            return DEFAULT_MTU
+        derived = max(MIN_MTU, min(DEFAULT_MTU, path - WG_OVERHEAD))
+        if derived != DEFAULT_MTU:
+            log.info("%s: mtu %d derived from %s (%d - %d overhead)",
+                     t.slug, derived, carrier, path, WG_OVERHEAD)
+        return derived
+
+    @staticmethod
+    def _carrier(t: Tunnel) -> tuple[str, int]:
+        """Which interface carries this tunnel's encrypted packets, and its MTU."""
+        if t.via:
+            # The parent's kind is not knowable from its slug, so try both
+            # prefixes; only one of them can exist.
+            for prefix in (config.WG_PREFIX, config.OVPN_PREFIX):
+                name = prefix + t.via
+                if ifaces.exists(name):
+                    return name, ifaces.mtu_of(name)
+            return f"{t.via} (not up)", 0
+        wan = config.Settings.load().net.wan_iface
+        return wan, ifaces.mtu_of(wan) if ifaces.exists(wan) else 0
 
     def down(self, t: Tunnel) -> None:
         # Deleting the link (rather than just downing it) makes the kernel

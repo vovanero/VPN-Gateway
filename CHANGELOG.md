@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.5.0 - a chained tunnel sizes itself to what carries it
+
+A WireGuard tunnel took a flat 1420 MTU no matter what it rode on. For a
+chained tunnel that is wrong by 100 bytes: its encrypted packets are 60 bytes
+larger than the plaintext inside them, and they have to fit the parent tunnel,
+which is typically 1380.
+
+The failure is the nastiest kind. The tunnel comes up. The handshake
+completes. `status` says up. Small packets work, so browsing looks fine and
+the health probe passes. Large ones vanish. What an operator sees is a
+download at full speed and an upload that does not move, with nothing in any
+log to say why.
+
+Measured on the reference pair, before and after, on a chained tunnel whose
+parent is 1380:
+
+    upload   0.87 Mbps  ->  5.44 Mbps
+    download  110 Mbps  ->    88 Mbps
+
+The MTU is now derived from whatever carries the tunnel - the parent tunnel
+when chained, the uplink otherwise - minus the 60 bytes of overhead. 1420
+stays the *ceiling* rather than becoming a starting point: a plain 1500-byte
+uplink would allow 1440, but paths lie about their size often enough that
+raising the default for everyone to gain 20 bytes is a bad trade. This only
+ever moves the MTU down, and only when something says it must. An MTU the
+operator set by hand is never overridden.
+
 ## 2.4.3 - a custom config without PersistentKeepalive could never come up
 
 Import a hand-written WireGuard config with no `PersistentKeepalive` line and

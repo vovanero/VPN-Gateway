@@ -243,6 +243,59 @@ class TestKeepaliveIsAlwaysSent(TestWireguardFwmark):
         self.assertNotIn("PersistentKeepalive = 25", text)
 
 
+class TestAutoMtu(unittest.TestCase):
+    """A chained tunnel must not be wider than the tunnel carrying it.
+
+    1420 inside a 1380 parent comes up, handshakes, passes small packets and
+    silently drops large ones. What that looks like from a chair is a download
+    that runs at full speed and an upload that does not move, with nothing in
+    any log to say why - so this is worth pinning.
+    """
+
+    def setUp(self):
+        from vpngw.tunnels.wg import WireGuardDriver
+        import vpngw.tunnels.wg as wgmod
+        import vpngw.net.ifaces as ifmod
+
+        self.drv = WireGuardDriver()
+        self.mtus = {}
+        self.addCleanup(setattr, wgmod.ifaces, "exists", wgmod.ifaces.exists)
+        self.addCleanup(setattr, wgmod.ifaces, "mtu_of", wgmod.ifaces.mtu_of)
+        wgmod.ifaces.exists = lambda n: n in self.mtus
+        wgmod.ifaces.mtu_of = lambda n: self.mtus.get(n, 0)
+
+    def test_a_chained_tunnel_shrinks_to_fit_its_parent(self):
+        from vpngw.tunnels.wg import WG_OVERHEAD
+        self.mtus["wg-aa01"] = 1380
+        self.assertEqual(self.drv._auto_mtu(wg("bb01", 2, via="aa01")),
+                         1380 - WG_OVERHEAD)
+
+    def test_1420_stays_the_ceiling_on_a_roomy_parent(self):
+        """A 1500-byte path would allow 1440; we do not take it."""
+        from vpngw.tunnels.wg import DEFAULT_MTU
+        self.mtus["wg-aa01"] = 1500
+        self.assertEqual(self.drv._auto_mtu(wg("bb01", 2, via="aa01")),
+                         DEFAULT_MTU)
+
+    def test_a_parent_that_is_not_up_falls_back(self):
+        from vpngw.tunnels.wg import DEFAULT_MTU
+        self.assertEqual(self.drv._auto_mtu(wg("bb01", 2, via="aa01")),
+                         DEFAULT_MTU)
+
+    def test_never_below_the_floor(self):
+        from vpngw.tunnels.wg import MIN_MTU
+        self.mtus["wg-aa01"] = 600
+        self.assertEqual(self.drv._auto_mtu(wg("bb01", 2, via="aa01")),
+                         MIN_MTU)
+
+    def test_an_explicit_mtu_is_never_overridden(self):
+        """The operator measured something; do not argue with them."""
+        self.mtus["wg-aa01"] = 1380
+        t = wg("bb01", 2, via="aa01")
+        t.mtu = 1200
+        self.assertEqual(t.mtu or self.drv._auto_mtu(t), 1200)
+
+
 class TestOpenvpnMark(unittest.TestCase):
     def test_mark_directive_present_exactly_when_chained(self):
         from vpngw.render import openvpn as r
