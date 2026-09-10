@@ -366,7 +366,28 @@ itself. Both are configuration discipline, not something a gateway can enforce.
 
 ## Updating
 
-`install.sh` leaves the updater on the box as `vpngw-update`:
+**Re-running `install.sh` is the update.** It keeps `/etc/vpngw/vpngw.toml`
+and never touches the database, so tunnels, clients, pools, chains, settings
+and the panel password all survive. There is no separate migration step and
+no special case - installing over an existing gateway is a supported, normal
+thing to do.
+
+The simplest way, and the one that sends nothing to GitHub from the gateway
+at all: copy the release across from the machine you administer it from.
+
+```bash
+# on your own machine
+scp -r VPN-Gateway root@<gateway>:/root/
+
+# on the gateway, as root
+cd /root/VPN-Gateway && ./install.sh
+```
+
+`vpngw-update` does the same install with three things added: it copies the
+running version aside, arms a rollback timer *before* replacing anything, and
+checks the new daemon actually answers before keeping it. If it does not, the
+old version comes back on its own. Every install from 2.4.0 leaves the command
+on the box:
 
 ```bash
 vpngw-update --check     # what is installed, what is available
@@ -375,28 +396,14 @@ vpngw-update --to v2.3.0 # a specific tag
 vpngw-update --rollback  # put the previous version back
 ```
 
-Run it as root. On a gateway installed **before 2.4.0** the command is not
-there yet - the updater used to ship only inside the release you did not
-have - so fetch it once, through a tunnel, the same way it would fetch
-itself:
+Run it as root. On a gateway installed before 2.4.0 the command is not there
+yet, because the updater used to ship only inside the release you did not
+have. Copy it across once and it is there for good:
 
 ```bash
-read -r IF NS <<<"$(PYTHONPATH=/opt/vpngw python3 -c 'from vpngw import config
-from vpngw.db import Database
-from vpngw.net import ifaces
-s, d = config.Settings.load(), Database()
-print(next((f"{t.iface} {s.dns.resolver_ip(t.esid)}"
-            for t in d.tunnels(enabled_only=True)
-            if ifaces.exists(t.iface)), ""))')"
-IP=$(dig +short raw.githubusercontent.com "@$NS" | grep -E '^[0-9.]+$' | head -1)
-curl -sS --fail --interface "$IF" --resolve "raw.githubusercontent.com:443:$IP"      -o /usr/local/bin/vpngw-update      https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/scripts/update.sh
-chmod 0755 /usr/local/bin/vpngw-update
-vpngw-update
+scp scripts/update.sh root@<gateway>:/usr/local/bin/vpngw-update
+ssh root@<gateway> chmod 0755 /usr/local/bin/vpngw-update
 ```
-
-That block does by hand exactly what the script does for itself: it picks a
-tunnel that is up, resolves the name through *that tunnel's* resolver, and
-downloads over that interface. A tunnel has to be up, for the reason below.
 
 It fetches **through a tunnel**, never over the uplink, and refuses to run if
 no tunnel is up. Asking GitHub for a new version of this software over the
