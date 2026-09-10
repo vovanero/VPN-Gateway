@@ -7,6 +7,7 @@ uptime - a test that fails when a provider has an outage teaches you nothing.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import os
@@ -396,3 +397,94 @@ class TestProviderFirewallIntegration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NordVpnTokenExchange(unittest.TestCase):
+    """The token buys the key, and only the key is kept.
+
+    The exchange is the whole point of the token field: an operator who has
+    to run `wg show nordlynx private-key` on another machine first has not
+    been saved any work.
+    """
+
+    def setUp(self):
+        from vpngw.providers.nordvpn import NordVpn
+        self.p = NordVpn()
+        self.calls = []
+
+        def fake_request(url, **kw):
+            self.calls.append((url, kw))
+            return self.reply
+
+        self.p.request = fake_request
+        self.reply = {"id": 1, "username": "u", "password": "p" * 32,
+                      "nordlynx_private_key": "A" * 43 + "="}
+
+    def test_token_is_exchanged_for_the_key(self):
+        creds = {"token": "tok123", "private_key": ""}
+        self.p.login(creds)
+        self.assertEqual(creds["private_key"], "A" * 43 + "=")
+
+        url, kw = self.calls[0]
+        self.assertIn("/v1/users/services/credentials", url)
+        # Basic auth over the literal username "token" - not a bearer header.
+        self.assertEqual(kw["auth"],
+                         "Basic " + base64.b64encode(b"token:tok123").decode())
+
+    def test_the_token_is_not_stored(self):
+        # api.py writes this same dict to /etc/vpngw/secrets. The token can
+        # manage the account; the key it buys can only build a tunnel.
+        creds = {"token": "tok123", "private_key": ""}
+        self.p.login(creds)
+        self.assertNotIn("token", creds)
+
+    def test_a_pasted_key_skips_the_exchange(self):
+        creds = {"token": "", "private_key": "B" * 43 + "="}
+        self.p.login(creds)
+        self.assertEqual(self.calls, [])
+
+    def test_a_renamed_field_is_still_found_by_shape(self):
+        self.reply = {"username": "u", "password": "p" * 32,
+                      "nordlynx_key_v2": "C" * 43 + "="}
+        creds = {"token": "tok", "private_key": ""}
+        self.p.login(creds)
+        self.assertEqual(creds["private_key"], "C" * 43 + "=")
+
+    def test_the_openvpn_password_is_not_mistaken_for_a_key(self):
+        # 44 characters, but no padding and not what we are looking for.
+        self.reply = {"username": "u", "password": "d" * 44}
+        with self.assertRaises(ProviderError):
+            self.p.login({"token": "tok", "private_key": ""})
+
+    def test_a_reply_without_a_key_names_the_fields_not_the_values(self):
+        self.reply = {"username": "u", "password": "hunter2hunter2hunter2"}
+        with self.assertRaises(ProviderError) as caught:
+            self.p.login({"token": "tok", "private_key": ""})
+        message = str(caught.exception)
+        self.assertIn("username", message)
+        self.assertNotIn("hunter2", message)
+
+    def test_no_credential_at_all_is_an_error_not_a_request(self):
+        with self.assertRaises(ProviderError):
+            self.p.login({"token": "", "private_key": ""})
+        self.assertEqual(self.calls, [])
+
+
+class OptionalAuthFields(unittest.TestCase):
+
+    def test_login_requires_only_the_required_fields(self):
+        """The panel and the API have to agree on what may be left empty."""
+        api = Path("vpngw/api.py").read_text(encoding="utf-8")
+        self.assertRegex(
+            api, r"if f\.required and not creds\[f\.key\]",
+            "provider_login must skip optional fields, or an either/or "
+            "credential dialog can never be submitted")
+
+    def test_every_provider_has_at_least_one_required_field(self):
+        for p in providers.all_providers():
+            if not p.auth_fields:
+                continue
+            self.assertTrue(
+                any(f.required for f in p.auth_fields),
+                f"{p.id} declares no required credential, so its dialog can "
+                f"be submitted empty")

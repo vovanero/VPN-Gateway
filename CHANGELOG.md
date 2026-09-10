@@ -1,5 +1,37 @@
 # Changelog
 
+## 2.4.0 - NordVPN asks for a token, and the updater installs itself
+
+**NordVPN takes an access token now.** The old field wanted a WireGuard
+private key, which meant installing NordVPN's own client on some other
+machine, connecting it, and reading the key out of the running interface
+with `wg show nordlynx private-key`. That was never necessary: NordVPN's API
+hands the NordLynx key to anyone holding the account's access token, and the
+token is a string you copy off the account page.
+
+- The exchange happens once, at connect. What is written to
+  `/etc/vpngw/secrets` is the same private key it always was.
+- **The token is not stored.** It can manage the account; the key it buys
+  can only build a tunnel, and a tunnel is all this box needs.
+- The key field is still there, marked optional, for operators who already
+  have one. `AuthField` grew a `required` flag so an either/or dialog is
+  possible at all - before this, the login endpoint rejected any submission
+  with an empty field, so a token-or-key choice could never have been
+  submitted.
+- The reply is parsed by field name first and by key *shape* second, so a
+  rename at NordVPN costs nothing. A reply with no key at all names the
+  fields it did contain - names only, since the values include the OpenVPN
+  password.
+
+**`install.sh` installs `vpngw-update`.** For three versions the updater
+shipped inside the release you did not have yet, which is a fine way to make
+a gateway unupdatable. Every install from here leaves the command on the box:
+
+    vpngw-update --check
+    vpngw-update
+
+- `provider_login` no longer answers in Turkish.
+
 ## 2.3.0 — updating, without phoning home
 
 `scripts/update.sh` fetches a new version **through a tunnel** and refuses to

@@ -46,6 +46,10 @@ class AuthField:
     secret: bool = False
     help: str = ""
     placeholder: str = ""
+    #: False for a field that is one of several ways of saying the same
+    #: thing. NordVPN takes an access token *or* a private key; demanding
+    #: both would make the easy path impossible.
+    required: bool = True
 
 
 @dataclass
@@ -157,6 +161,7 @@ class Provider:
         *,
         method: str = "GET",
         token: str = "",
+        auth: str = "",
         payload: Any = None,
         timeout: int = TIMEOUT,
     ) -> Any:
@@ -172,7 +177,12 @@ class Provider:
         headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if token:
+        # Bearer is what most of these APIs want; `auth` is the escape hatch
+        # for the ones that do not - NordVPN authenticates its credentials
+        # endpoint with Basic auth over a token, not a bearer header.
+        if auth:
+            headers["Authorization"] = auth
+        elif token:
             headers["Authorization"] = f"Bearer {token}"
 
         req = urllib.request.Request(url, data=data, method=method,

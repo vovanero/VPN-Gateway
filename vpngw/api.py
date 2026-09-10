@@ -627,7 +627,8 @@ def create_app(service) -> FastAPI:
             "api_allowed": p.id in allowed,
             "auth_fields": [
                 {"key": f.key, "label": f.label, "secret": f.secret,
-                 "help": f.help, "placeholder": f.placeholder}
+                 "help": f.help, "placeholder": f.placeholder,
+                 "required": f.required}
                 for f in p.auth_fields
             ],
         } for p in registry.all_providers()]
@@ -673,10 +674,11 @@ def create_app(service) -> FastAPI:
         provider = registry.get(provider_id)
         creds = {f.key: str(body.get(f.key, "")).strip()
                  for f in provider.auth_fields}
-        missing = [f.label for f in provider.auth_fields if not creds[f.key]]
+        missing = [f.label for f in provider.auth_fields
+                   if f.required and not creds[f.key]]
         if missing:
             raise HTTPException(status_code=400,
-                                detail=f"eksik alan: {', '.join(missing)}")
+                                detail=f"missing: {', '.join(missing)}")
 
         # The API host must pass our own firewall before the first request.
         service.reconciler.enable_provider(provider_id)

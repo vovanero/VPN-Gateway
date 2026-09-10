@@ -366,11 +366,37 @@ itself. Both are configuration discipline, not something a gateway can enforce.
 
 ## Updating
 
+`install.sh` leaves the updater on the box as `vpngw-update`:
+
 ```bash
-sudo scripts/update.sh --check     # what is installed, what is available
-sudo scripts/update.sh             # fetch the newest tag and install it
-sudo scripts/update.sh --rollback  # put the previous version back
+vpngw-update --check     # what is installed, what is available
+vpngw-update             # fetch the newest tag and install it
+vpngw-update --to v2.3.0 # a specific tag
+vpngw-update --rollback  # put the previous version back
 ```
+
+Run it as root. On a gateway installed **before 2.4.0** the command is not
+there yet - the updater used to ship only inside the release you did not
+have - so fetch it once, through a tunnel, the same way it would fetch
+itself:
+
+```bash
+read -r IF NS <<<"$(PYTHONPATH=/opt/vpngw python3 -c 'from vpngw import config
+from vpngw.db import Database
+from vpngw.net import ifaces
+s, d = config.Settings.load(), Database()
+print(next((f"{t.iface} {s.dns.resolver_ip(t.esid)}"
+            for t in d.tunnels(enabled_only=True)
+            if ifaces.exists(t.iface)), ""))')"
+IP=$(dig +short raw.githubusercontent.com "@$NS" | grep -E '^[0-9.]+$' | head -1)
+curl -sS --fail --interface "$IF" --resolve "raw.githubusercontent.com:443:$IP"      -o /usr/local/bin/vpngw-update      https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/scripts/update.sh
+chmod 0755 /usr/local/bin/vpngw-update
+vpngw-update
+```
+
+That block does by hand exactly what the script does for itself: it picks a
+tunnel that is up, resolves the name through *that tunnel's* resolver, and
+downloads over that interface. A tunnel has to be up, for the reason below.
 
 It fetches **through a tunnel**, never over the uplink, and refuses to run if
 no tunnel is up. Asking GitHub for a new version of this software over the

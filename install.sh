@@ -383,6 +383,15 @@ EOF
 chmod 0755 /usr/local/bin/vpngwctl
 ok "vpngwctl"
 
+# The updater installs itself, so a gateway is never in the position this one
+# was in for its first three versions: able to run, unable to update, because
+# the script that updates it only shipped inside the version you did not have.
+# Every install from here on leaves `vpngw-update` on the box.
+if [[ -f "$SRC/scripts/update.sh" ]]; then
+    install -m 0755 "$SRC/scripts/update.sh" /usr/local/bin/vpngw-update
+    ok "vpngw-update"
+fi
+
 [[ -f "$SRC/README.md" ]] && cp "$SRC/README.md" /usr/share/doc/vpngw/
 [[ -d "$SRC/docs" ]] && cp -r "$SRC/docs/." /usr/share/doc/vpngw/ 2>/dev/null || true
 

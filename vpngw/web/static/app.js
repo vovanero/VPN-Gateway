@@ -1595,14 +1595,22 @@ function openLoginDialog(p) {
   loginProvider = p;
   $("#loginTitle").textContent = `Connect your ${p.name} account`;
   $("#loginNotes").textContent = p.notes || "";
-  $("#loginFields").replaceChildren(...p.auth_fields.map((f) =>
-    el("label", { class: "field" },
-      el("span", {}, f.label, f.secret ? "" : ""),
+  $("#loginFields").replaceChildren(...p.auth_fields.map((f) => {
+    // A provider can offer more than one way to say the same thing - an
+    // access token or the key it would fetch - so a field is only required
+    // when the plugin says it is. Marking the optional one keeps the browser
+    // from demanding both, and says which one the operator can skip.
+    const optional = f.required === false;
+    return el("label", { class: "field" },
+      el("span", {}, f.label,
+        optional ? el("em", { class: "field-optional" }, "optional") : null),
       el("input", {
         name: f.key, type: f.secret ? "password" : "text",
-        placeholder: f.placeholder || "", autocomplete: "off", required: true,
+        placeholder: f.placeholder || "", autocomplete: "off",
+        required: !optional,
       }),
-      f.help ? el("small", {}, f.help) : null)));
+      f.help ? el("small", {}, f.help) : null);
+  }));
   $("#dlgProviderLogin").showModal();
 }
 
