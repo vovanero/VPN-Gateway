@@ -775,3 +775,8 @@ input:user-invalid, select:user-invalid { border-color: var(--danger); }
   text-transform: uppercase;
   color: var(--muted);
 }
+
+/* The country label under an exit address. Quiet: the address is the fact,
+   this is a hint, and a hint that shouts is worse than none. */
+.inline-country { display: inline; margin-left: 8px; }
+td .sub + .sub, td.mono .sub { margin-top: 2px; }

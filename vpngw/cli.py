@@ -341,7 +341,11 @@ def cmd_tunnel_set(args, db: Database, settings) -> int:
         t.enabled = False
     if args.name:
         t.name = args.name
-    if args.mtu:
+    # `--mtu 0` is how you hand the decision back to the gateway, which then
+    # measures the path. Without this, an operator who set an MTU by hand had
+    # no way to undo it - `0` read as "no argument given" and silently kept
+    # whatever was there.
+    if args.mtu is not None:
         t.mtu = args.mtu
     if args.via is not None:
         via = "" if args.via in ("-", "none", "off") else args.via
@@ -353,7 +357,8 @@ def cmd_tunnel_set(args, db: Database, settings) -> int:
                          f"before disabling it")
     db.update_tunnel(t)
     chain = f" via={t.via}" if t.via else ""
-    print(f"{t.slug}: enabled={t.enabled} mtu={t.mtu or 'default'}{chain}")
+    print(f"{t.slug}: enabled={t.enabled} "
+          f"mtu={t.mtu or 'automatic (measured)'}{chain}")
     Daemon(settings).nudge()
     return 0
 

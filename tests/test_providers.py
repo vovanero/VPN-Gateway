@@ -11,6 +11,7 @@ import base64
 import io
 import json
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -488,3 +489,79 @@ class OptionalAuthFields(unittest.TestCase):
                 any(f.required for f in p.auth_fields),
                 f"{p.id} declares no required credential, so its dialog can "
                 f"be submitted empty")
+
+
+class OfflineCountryLookup(unittest.TestCase):
+    """A label beside the exit address, decided without leaving the machine.
+
+    The point of doing it offline is that a privacy gateway should not make a
+    call about its own exit address every time a dashboard refreshes. The
+    price is stale data, so the rules that matter here are about *not
+    knowing*: every kind of "no answer" must render as nothing at all, and
+    none of them may raise - a cosmetic lookup must never be able to stop the
+    panel from drawing.
+    """
+
+    def setUp(self):
+        from vpngw import geo
+        self.geo = geo
+        geo.forget()
+        self.addCleanup(geo.forget)
+
+    def _fake(self, stdout, ok=True):
+        from vpngw import geo
+        self.addCleanup(setattr, geo, "try_run", geo.try_run)
+        self.addCleanup(setattr, geo, "available", geo.available)
+        geo.available = lambda: True
+        geo.try_run = lambda *a, **k: type("R", (), {"ok": ok, "stdout": stdout})
+
+    def test_it_reads_a_country(self):
+        self._fake("GeoIP Country Edition: PT, Portugal\n")
+        self.assertEqual(self.geo.country_of("185.231.233.118"),
+                         ("PT", "Portugal"))
+
+    def test_an_unknown_range_is_not_knowing_rather_than_a_guess(self):
+        self._fake("GeoIP Country Edition: IP Address not found\n")
+        self.assertIsNone(self.geo.country_of("10.0.0.1"))
+
+    def test_the_placeholder_country_is_also_not_knowing(self):
+        self._fake("GeoIP Country Edition: --, N/A\n")
+        self.assertIsNone(self.geo.country_of("192.0.2.1"))
+
+    def test_no_database_means_no_answer_and_no_error(self):
+        from vpngw import geo
+        self.addCleanup(setattr, geo, "available", geo.available)
+        geo.available = lambda: False
+        self.assertIsNone(geo.country_of("185.231.233.118"))
+
+    def test_a_failed_lookup_does_not_raise(self):
+        self._fake("", ok=False)
+        self.assertIsNone(self.geo.country_of("185.231.233.118"))
+
+    def test_the_answer_is_cached(self):
+        calls = []
+        from vpngw import geo
+        self.addCleanup(setattr, geo, "try_run", geo.try_run)
+        self.addCleanup(setattr, geo, "available", geo.available)
+        geo.available = lambda: True
+
+        def counted(*a, **k):
+            calls.append(a)
+            return type("R", (), {"ok": True,
+                                  "stdout": "GeoIP Country Edition: PT, Portugal"})
+
+        geo.try_run = counted
+        geo.country_of("1.2.3.4")
+        geo.country_of("1.2.3.4")
+        self.assertEqual(len(calls), 1)
+
+    def test_an_empty_address_asks_nothing(self):
+        self._fake("should not be reached")
+        self.assertIsNone(self.geo.country_of(""))
+
+    def test_the_installer_brings_the_database(self):
+        """Offline only works if the data is actually on the box."""
+        script = Path("install.sh").read_text(encoding="utf-8")
+        pkgs = re.search(r"^PKGS=\((.*?)^\)", script, re.M | re.S).group(1)
+        self.assertIn("geoip-database", pkgs.split())
+        self.assertIn("geoip-bin", pkgs.split())

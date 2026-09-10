@@ -317,6 +317,7 @@ export DEBIAN_FRONTEND=noninteractive
 PKGS=(
     nftables wireguard-tools openvpn conntrack dnsmasq-base
     iproute2 iputils-ping curl ca-certificates tcpdump ethtool bind9-dnsutils
+    geoip-database geoip-bin
     netcat-openbsd python3 python3-fastapi python3-uvicorn python3-multipart
 )
 # Ask for real package names, not virtual ones. `dnsutils` is only a name

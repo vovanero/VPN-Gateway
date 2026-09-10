@@ -731,7 +731,8 @@ function tunnelCard(t) {
       sparkline(hist, state === "up" ? COLOR.tx : "var(--text-3)"),
       el("div", { class: "row", style: "margin-top:10px;font-size:12.5px" },
         el("span", { class: "mono", style: "color:var(--text-2)" },
-          t.exit_ip || (t.enabled ? "measuring exit address…" : "disabled")),
+          t.exit_ip || (t.enabled ? "measuring exit address…" : "disabled"),
+          exitCountry(t, "inline-country")),
         el("span", { class: "spacer" }),
         el("span", { style: "color:var(--text-3)" },
           t.rtt_ms ? `${Math.round(t.rtt_ms)} ms` : "—"))));
@@ -1005,6 +1006,28 @@ function openChainDialog() {
   };
 }
 
+/** Country beside an exit address, when the offline database knows it.
+ *
+ *  A hint, never a claim: the lookup is a local database whose data is
+ *  frozen at 2019, and VPN exit ranges change hands. The address stays the
+ *  fact on screen; this is a label under it, and it is simply absent when
+ *  nothing is known - which is the honest rendering of not knowing.
+ */
+function exitCountry(t, cls) {
+  if (!t.exit_country) return null;
+  return el("div", { class: "sub" + (cls ? " " + cls : "") },
+    t.exit_country_code ? flagOf(t.exit_country_code) + " " : "",
+    t.exit_country);
+}
+
+/** A two-letter code as its regional-indicator flag. Pure arithmetic on the
+ *  code points, so there is no table to keep current. */
+function flagOf(code) {
+  if (!/^[A-Za-z]{2}$/.test(code)) return "";
+  return String.fromCodePoint(...[...code.toUpperCase()]
+    .map((c) => 0x1f1e6 + c.charCodeAt(0) - 65));
+}
+
 function tunnelRow(t) {
   const state = t.enabled ? t.state : "disabled";
   const users = t.direct_clients + t.pool_clients;
@@ -1016,7 +1039,7 @@ function tunnelRow(t) {
     el("td", { class: "tight" }, pill(state),
       t.enabled && t.state === "down" && t.last_error
         ? el("div", { class: "sub wrap" }, t.last_error) : null),
-    el("td", { class: "mono" }, t.exit_ip || "—"),
+    el("td", { class: "mono" }, t.exit_ip || "—", exitCountry(t)),
     el("td", { class: "tight num" }, t.rtt_ms ? `${Math.round(t.rtt_ms)} ms` : "—"),
     el("td", { class: "tight num", style: "font-size:12.5px" },
       el("div", {}, "↓ " + rate(t.rx_rate)),
@@ -2018,7 +2041,8 @@ function renderDrawer() {
       el("dl", { class: "kv" },
         el("dt", {}, "Kind"), el("dd", {}, t.kind),
         el("dt", {}, "Interface"), el("dd", {}, t.iface),
-        el("dt", {}, "Exit address"), el("dd", {}, t.exit_ip || "—"),
+        el("dt", {}, "Exit address"),
+        el("dd", {}, t.exit_ip || "—", exitCountry(t)),
         el("dt", {}, "Latency"), el("dd", {}, t.rtt_ms ? Math.round(t.rtt_ms) + " ms" : "—"),
         el("dt", {}, "Up for"), el("dd", {}, t.up_since ? ago(t.up_since) : "—"),
         el("dt", {}, "MTU"), el("dd", {}, t.mtu || "default"),

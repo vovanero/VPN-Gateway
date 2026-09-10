@@ -33,6 +33,17 @@ WG_OVERHEAD = 60
 #: Never derive below this. Anything smaller is almost certainly a misread
 #: parent rather than a real path, and IPv6 requires 1280 regardless.
 MIN_MTU = 1280
+#: A packet small enough to cross anything. Its only job is to tell "this
+#: endpoint does not answer ICMP" apart from "this path is narrow", which are
+#: opposite conclusions from the same silence.
+PROBE_PING = 100
+#: The smallest outer packet worth measuring: below this the inner MTU would
+#: be under MIN_MTU anyway, so there is nothing left to learn.
+PROBE_FLOOR = MIN_MTU + WG_OVERHEAD
+#: Bisect to the byte. The bracket is only ~140 bytes wide, so exactness
+#: costs about three extra probes - worth it, because an MTU that is a few
+#: bytes short is indistinguishable from a bug when someone checks it later.
+PROBE_GRAIN = 1
 
 
 #: Sent when a config does not name one. 25 seconds is what every
@@ -105,6 +116,10 @@ class WireGuardDriver(TunnelDriver):
 
     # -- lifecycle ----------------------------------------------------------
 
+    #: (slug, endpoint) -> largest outer packet measured, or 0 for "no ICMP".
+    #: Keyed by endpoint so a provider moving us to another server re-probes.
+    _probed: dict[tuple[str, str], int] = {}
+
     def up(self, t: Tunnel) -> LinkInfo:
         spec = self._load(t)
         iface = t.iface
@@ -134,6 +149,39 @@ class WireGuardDriver(TunnelDriver):
         log.info("wireguard %s up (mtu %s, addr %s)", iface, mtu, info.local_ip)
         return info
 
+    def _probe_path_mtu(self, endpoint: str, ceiling: int) -> int:
+        """Largest IP packet that reaches ``endpoint`` with DF set, or 0.
+
+        The interface a tunnel leaves through only knows its own size. It
+        cannot know that the uplink is itself a client of another gateway
+        whose tunnel is narrower - which is exactly the shape of a two-machine
+        double VPN, and exactly where the arithmetic gives an answer that is
+        80 bytes too generous. Asking the path is the only way to find out.
+
+        Returns 0 when the endpoint does not answer ICMP at all. That is
+        common enough that it must never be mistaken for a tiny path: an
+        unanswered probe would otherwise clamp every such tunnel to the floor.
+        """
+        def fits(size: int) -> bool:
+            res = try_run(["ping", "-M", "do", "-s", str(size - 28), "-c", "1",
+                           "-W", "2", "-n", "-q", endpoint], timeout=5)
+            return res.ok
+
+        if not fits(PROBE_PING):
+            return 0                      # silent endpoint; nothing to learn
+        if fits(ceiling):
+            return ceiling
+        if not fits(PROBE_FLOOR):
+            return PROBE_FLOOR            # narrower than we will go; clamp
+        lo, hi = PROBE_FLOOR, ceiling
+        while hi - lo > PROBE_GRAIN:
+            mid = (lo + hi) // 2
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
     def _auto_mtu(self, t: Tunnel) -> int:
         """The largest inner MTU that still fits what carries this tunnel.
 
@@ -153,13 +201,27 @@ class WireGuardDriver(TunnelDriver):
         ever moves the MTU *down*, and only when something says it must.
         """
         carrier, path = self._carrier(t)
-        if path <= 0:
-            return DEFAULT_MTU
-        derived = max(MIN_MTU, min(DEFAULT_MTU, path - WG_OVERHEAD))
-        if derived != DEFAULT_MTU:
+        ceiling = DEFAULT_MTU if path <= 0 else max(
+            MIN_MTU, min(DEFAULT_MTU, path - WG_OVERHEAD))
+
+        # Then ask the path itself, which knows things the interface does not.
+        endpoint = (t.endpoints or [""])[0]
+        cached = self._probed.get((t.slug, endpoint))
+        if endpoint and cached is None:
+            cached = self._probe_path_mtu(endpoint, ceiling + WG_OVERHEAD)
+            self._probed[(t.slug, endpoint)] = cached
+        if cached:
+            probed = max(MIN_MTU, min(ceiling, cached - WG_OVERHEAD))
+            if probed != ceiling:
+                log.info("%s: mtu %d measured to %s (%d bytes was the largest "
+                         "that got through; %s says %d)",
+                         t.slug, probed, endpoint, cached, carrier, path)
+            return probed
+
+        if ceiling != DEFAULT_MTU:
             log.info("%s: mtu %d derived from %s (%d - %d overhead)",
-                     t.slug, derived, carrier, path, WG_OVERHEAD)
-        return derived
+                     t.slug, ceiling, carrier, path, WG_OVERHEAD)
+        return ceiling
 
     @staticmethod
     def _carrier(t: Tunnel) -> tuple[str, int]:

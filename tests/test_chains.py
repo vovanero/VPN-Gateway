@@ -296,6 +296,83 @@ class TestAutoMtu(unittest.TestCase):
         self.assertEqual(t.mtu or self.drv._auto_mtu(t), 1200)
 
 
+class TestProbedMtu(unittest.TestCase):
+    """Ask the path, because the interface cannot see past the next hop.
+
+    A gateway whose uplink is itself a client of another gateway sits behind
+    a tunnel it has no way to inspect. Locally everything says 1500; the real
+    limit was 1380, and a tunnel built on the local answer was completely dead
+    - not slow, dead. Measured on the reference pair: at 1420 the tunnel moved
+    0.00 Mbps in both directions, at 1320 it moved 7.4.
+    """
+
+    def setUp(self):
+        from vpngw.tunnels.wg import WireGuardDriver
+        import vpngw.tunnels.wg as wgmod
+
+        self.drv = WireGuardDriver()
+        self.drv._probed = {}
+        self.limit = 10_000        # largest outer packet the fake path passes
+        self.silent = False
+        self.sizes = []
+
+        def fake_try_run(argv, **kw):
+            size = int(argv[argv.index("-s") + 1]) + 28
+            self.sizes.append(size)
+            return type("R", (), {"ok": not self.silent and size <= self.limit})
+
+        self.addCleanup(setattr, wgmod, "try_run", wgmod.try_run)
+        wgmod.try_run = fake_try_run
+        wgmod.ifaces.exists = lambda n: True
+        wgmod.ifaces.mtu_of = lambda n: 1500
+        self.addCleanup(setattr, wgmod.ifaces, "exists", wgmod.ifaces.exists)
+        self.addCleanup(setattr, wgmod.ifaces, "mtu_of", wgmod.ifaces.mtu_of)
+
+    def _tunnel(self):
+        t = wg("bb01", 2, via="aa01")
+        t.endpoints = ["203.0.113.9"]
+        return t
+
+    def test_it_finds_the_real_limit_behind_a_lying_interface(self):
+        from vpngw.tunnels.wg import WG_OVERHEAD
+        self.limit = 1380                       # what the reference pair had
+        self.assertEqual(self._tunnel().mtu or self.drv._auto_mtu(self._tunnel()),
+                         1380 - WG_OVERHEAD)    # 1320, measured by hand too
+
+    def test_a_roomy_path_keeps_the_ceiling(self):
+        from vpngw.tunnels.wg import DEFAULT_MTU
+        self.limit = 1500
+        self.assertEqual(self.drv._auto_mtu(self._tunnel()), DEFAULT_MTU)
+
+    def test_a_silent_endpoint_is_not_read_as_a_tiny_path(self):
+        """Plenty of hosts drop ICMP. That must not clamp the tunnel."""
+        from vpngw.tunnels.wg import DEFAULT_MTU
+        self.silent = True
+        self.assertEqual(self.drv._auto_mtu(self._tunnel()), DEFAULT_MTU)
+
+    def test_a_path_narrower_than_the_floor_clamps_rather_than_bisects(self):
+        from vpngw.tunnels.wg import MIN_MTU
+        self.limit = 900
+        self.assertEqual(self.drv._auto_mtu(self._tunnel()), MIN_MTU)
+
+    def test_the_result_is_cached_per_endpoint(self):
+        self.limit = 1380
+        t = self._tunnel()
+        self.drv._auto_mtu(t)
+        first = len(self.sizes)
+        self.drv._auto_mtu(t)
+        self.assertEqual(len(self.sizes), first, "re-probed a known endpoint")
+        t.endpoints = ["203.0.113.10"]          # provider moved us
+        self.drv._auto_mtu(t)
+        self.assertGreater(len(self.sizes), first, "did not re-probe a new one")
+
+    def test_probing_is_bounded(self):
+        self.limit = 1380
+        self.drv._auto_mtu(self._tunnel())
+        self.assertLess(len(self.sizes), 12,
+                        "too many pings at tunnel bring-up")
+
+
 class TestOpenvpnMark(unittest.TestCase):
     def test_mark_directive_present_exactly_when_chained(self):
         from vpngw.render import openvpn as r

@@ -19,7 +19,7 @@ import threading
 import time
 from collections import deque
 
-from . import config
+from . import config, geo
 from .db import Database
 from .reconciler import Reconciler
 
@@ -228,6 +228,11 @@ class Service:
                 "via": t.via,
                 "rtt_ms": h.rtt_ms,
                 "exit_ip": h.exit_ip,
+                # A label beside the address, looked up offline. None when
+                # there is no database installed or the range is unknown -
+                # the panel then shows the address alone, which is the fact.
+                "exit_country": (geo.country_of(h.exit_ip) or (None, None))[1],
+                "exit_country_code": (geo.country_of(h.exit_ip) or (None, None))[0],
                 "up_since": h.up_since,
                 "last_change": h.last_change,
                 "last_error": h.last_error,

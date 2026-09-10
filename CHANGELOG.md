@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.6.0 - the MTU is measured, and the exit address has a country
+
+**The gateway measures the path instead of trusting the interface.** 2.5.0
+derived a chained tunnel's MTU from the interface carrying it, which is right
+until the uplink is itself a client of another gateway - the exact shape of a
+two-machine double VPN. Locally everything reads 1500; the real limit was
+1380, and the arithmetic answer was 80 bytes too generous.
+
+That is not a slow tunnel, it is a dead one. Measured on the reference pair,
+a fresh tunnel at the derived MTU:
+
+    1420   download 0.00 Mbps   upload 0.00 Mbps
+    1320   download 7.44 Mbps   upload 7.45 Mbps
+
+So the tunnel's endpoint is now probed directly with DF pings, bisecting to
+the byte, and the MTU comes from what actually got through. On the reference
+pair it lands on 1320 for both tunnels in about eight seconds - the same
+number that was found by hand.
+
+- An endpoint that ignores ICMP is not read as a tiny path. That is a
+  separate small probe, because "no answer" and "narrow path" are opposite
+  conclusions drawn from the same silence.
+- Results are cached per endpoint, so a reconcile pass does not re-probe, and
+  a provider moving you to another server does.
+- `vpngwctl tunnel set <slug> --mtu 0` hands the decision back to the
+  gateway. It used to read as "no argument given" and silently keep whatever
+  was set, so an operator who had pinned an MTU had no way to unpin it.
+
+**The exit address carries a country**, looked up offline. `geoip-database`
+and `geoip-bin` are now installed, and nothing leaves the machine to answer
+the question - a privacy gateway should not be making a call about its own
+exit address every time a dashboard refreshes.
+
+The data is Debian's legacy GeoIP, frozen on 2019-12-24, so a lookup can be
+out of date and has no way to know it. It is shown as a hint under the
+address, never instead of it, and every kind of "we do not know" - no
+database, private range, unknown range, failed lookup - renders as nothing
+at all rather than a guess.
+
 ## 2.5.0 - a chained tunnel sizes itself to what carries it
 
 A WireGuard tunnel took a flat 1420 MTU no matter what it rode on. For a
