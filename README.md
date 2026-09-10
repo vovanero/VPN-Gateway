@@ -405,6 +405,28 @@ scp scripts/update.sh root@<gateway>:/usr/local/bin/vpngw-update
 ssh root@<gateway> chmod 0755 /usr/local/bin/vpngw-update
 ```
 
+Or fetch it on the gateway itself, as root, doing by hand the three steps the
+script does for itself - find a tunnel that is up, resolve the name through
+*that tunnel's* resolver, bind the download to that interface:
+
+```bash
+read -r IF NS <<<"$(PYTHONPATH=/opt/vpngw python3 -c 'from vpngw import config
+from vpngw.db import Database
+from vpngw.net import ifaces
+s = config.Settings.load()
+print(next((f"{t.iface} {s.dns.resolver_ip(t.esid)}"
+            for t in Database().tunnels(enabled_only=True)
+            if ifaces.exists(t.iface)), ""))')"
+curl -sS --fail --interface "$IF" -o /usr/local/bin/vpngw-update   --resolve "raw.githubusercontent.com:443:$(dig +short raw.githubusercontent.com "@$NS" | grep -m1 -E '^[0-9.]+$')"   https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/scripts/update.sh
+chmod 0755 /usr/local/bin/vpngw-update
+```
+
+None of those three steps is optional. The gateway's own `/etc/resolv.conf`
+points at a public resolver over the uplink, so a plain `curl` would ask the
+ISP for `raw.githubusercontent.com` before any of the download went through a
+tunnel - and the name is the leak. With no tunnel up, `$IF` is empty and curl
+fails rather than falling back, which is the behaviour to want.
+
 It fetches **through a tunnel**, never over the uplink, and refuses to run if
 no tunnel is up. Asking GitHub for a new version of this software over the
 uplink would tell an ISP that this address runs a VPN gateway and which
