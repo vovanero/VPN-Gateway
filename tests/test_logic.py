@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import sys
 import tempfile
 import unittest
@@ -712,6 +713,59 @@ class ShippedSourceIsIntact(unittest.TestCase):
     def test_the_snapshot_can_read_the_version(self):
         """service.snapshot() reaches for it by name; prove the name is there."""
         self.assertTrue(hasattr(__import__("vpngw"), "__version__"))
+
+
+class InstallerAsksForRealThings(unittest.TestCase):
+    """Two bugs the reference machines found, pinned so they stay fixed.
+
+    Neither showed up as a failure. One made every run wait on apt timeouts
+    that could never succeed; the other printed a summary describing a network
+    the machine did not have. Both are the kind of wrong that costs an
+    operator an afternoon and never trips a test.
+    """
+
+    SCRIPT = (Path(__file__).resolve().parent.parent / "install.sh"
+              ).read_text(encoding="utf-8")
+
+    #: Names apt resolves but dpkg can never confirm, because the real package
+    #: is called something else. `dpkg -s` on one of these always says "not
+    #: installed", so it lands in MISSING on every run and sends a fully
+    #: provisioned gateway to the mirrors - which, with the kill switch armed,
+    #: means sitting through timeouts for a package that was never absent.
+    VIRTUAL_ON_DEBIAN_13 = ("dnsutils",)
+
+    def test_packages_are_real_package_names(self):
+        pkgs = re.search(r"^PKGS=\((.*?)^\)", self.SCRIPT, re.M | re.S)
+        self.assertIsNotNone(pkgs, "PKGS block not found in install.sh")
+        listed = pkgs.group(1).split()
+        for name in self.VIRTUAL_ON_DEBIAN_13:
+            self.assertNotIn(
+                name, listed,
+                f"{name} is a virtual package on Debian 13; dpkg -s can never "
+                f"confirm it, so install.sh would call apt on every run")
+        self.assertIn("bind9-dnsutils", listed,
+                      "dig has to come from somewhere")
+
+    def test_every_checked_tool_has_a_package(self):
+        """The `command -v` loop and PKGS have to cover the same ground."""
+        tools = re.search(r"^for tool in ([^;]+); do", self.SCRIPT, re.M)
+        self.assertIsNotNone(tools)
+        self.assertIn("dig", tools.group(1).split(),
+                      "install.sh installs dig but never checks it is there")
+
+    def test_an_existing_config_is_read_back_before_the_summary(self):
+        """What the summary claims must be what the daemon will read.
+
+        When vpngw.toml already exists the installer keeps it - so the values
+        detected earlier are not what the machine will run, and printing them
+        tells the operator the wrong client network and the wrong panel URL.
+        """
+        kept = self.SCRIPT.index("exists, left alone")
+        summary = self.SCRIPT.index("Topology as installed")
+        between = self.SCRIPT[kept:summary]
+        self.assertIn("config.Settings.load()", between,
+                      "the summary reports detected values over a config that "
+                      "was kept; read the config back first")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,33 @@
 # Changelog
 
+## 2.4.2 - the installer stops asking apt for a package that does not exist
+
+Two bugs a second machine found. Neither failed anything; both wasted an
+operator's afternoon.
+
+**`dnsutils` is not a package on Debian 13.** It is a name `bind9-dnsutils`
+provides, so `dpkg -s dnsutils` never reports it installed - and install.sh
+put it in the missing list on *every single run*, on a fully provisioned
+gateway, and went to the mirrors for it. With the kill switch armed the
+gateway's own egress is dropped by design, so `apt-get update` sits through
+its timeouts before carrying on. An update that looks like it has hung is an
+update people interrupt, which is exactly what happened. The installer now
+asks for `bind9-dnsutils`, finds nothing missing, and never calls apt.
+
+`dig` joins the `command -v` check, since the installer installs it.
+
+**The summary described a machine that did not exist.** When `vpngw.toml`
+already exists the installer keeps it - correctly - but then printed the
+layout it had *detected*, not the one in force. On a box whose client network
+is 10.0.0.1/24 the summary said 10.20.0.1/24 and pointed the operator at a
+panel URL that answers nowhere. It now reads the kept config back through the
+daemon's own parser before printing anything, so the summary and the daemon
+cannot disagree.
+
+Both are pinned by tests: no virtual package names in the package list, `dig`
+in the tool check, and the config read back between "left alone" and the
+summary.
+
 ## 2.4.1 - do not install 2.4.0
 
 `vpngw/__init__.py` shipped empty in 2.4.0. An empty module imports fine and
