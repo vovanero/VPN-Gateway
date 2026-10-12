@@ -768,5 +768,74 @@ class InstallerAsksForRealThings(unittest.TestCase):
                       "was kept; read the config back first")
 
 
+class SelftestPicksALiveTunnel(unittest.TestCase):
+    """The leak test must test through something that can carry traffic.
+
+    It used to pick the first enabled tunnel by position. On the reference
+    gateway that was one which had never completed a handshake, so the test
+    client was - correctly - blackholed, and the suite reported "1 CRITICAL
+    FAILURE. Do not treat this gateway as leak-proof" on a gateway where every
+    check passed against its live tunnel.
+    """
+
+    class _T:
+        def __init__(self, slug):
+            self.slug = slug
+
+    class _DB:
+        def __init__(self, slugs):
+            self._t = [SelftestPicksALiveTunnel._T(s) for s in slugs]
+
+        def tunnels(self, enabled_only=False):
+            return list(self._t)
+
+    class _Daemon:
+        def __init__(self, tunnels=None, fail=False):
+            self._tunnels, self._fail = tunnels or [], fail
+
+        def call(self, path, *a, **k):
+            if self._fail:
+                raise OSError("daemon unreachable")
+            return {"tunnels": self._tunnels}
+
+    def _pick(self, slugs, status, fail=False):
+        from vpngw.cli import _live_egress
+        return _live_egress(self._Daemon(status, fail), self._DB(slugs))
+
+    def test_a_dead_first_tunnel_is_skipped(self):
+        status = [{"slug": "fi02", "state": "down", "routed": False},
+                  {"slug": "vpn1", "state": "up", "routed": True}]
+        self.assertEqual(self._pick(["fi02", "vpn1"], status), "tunnel:vpn1")
+
+    def test_up_but_not_routed_is_not_live(self):
+        """Health can say up a moment before the route lands; route decides."""
+        status = [{"slug": "a", "state": "up", "routed": False},
+                  {"slug": "b", "state": "up", "routed": True}]
+        self.assertEqual(self._pick(["a", "b"], status), "tunnel:b")
+
+    def test_no_live_tunnel_refuses_rather_than_reporting_a_leak(self):
+        status = [{"slug": "a", "state": "down", "routed": False}]
+        with self.assertRaises(SystemExit) as caught:
+            self._pick(["a"], status)
+        self.assertIn("not a leak", str(caught.exception))
+
+    def test_an_unreachable_daemon_is_not_mistaken_for_a_live_tunnel(self):
+        with self.assertRaises(SystemExit):
+            self._pick(["a"], [], fail=True)
+
+    def test_no_enabled_tunnel_at_all(self):
+        with self.assertRaises(SystemExit):
+            self._pick([], [])
+
+    def test_the_panel_follows_the_same_rule(self):
+        js = (Path(__file__).resolve().parent.parent
+              / "vpngw/web/static/app.js").read_text(encoding="utf-8")
+        body = js[js.index("async function runSelftest"):]
+        body = body[:body.index("\n}\n")]
+        self.assertNotIn("enabled[0].slug", body,
+                         "the panel still tests through a tunnel by position")
+        self.assertIn('t.state === "up" && t.routed', body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

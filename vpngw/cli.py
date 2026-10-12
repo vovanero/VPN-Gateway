@@ -824,14 +824,46 @@ def cmd_check(args, db: Database, settings) -> int:
     return 1 if problems else 0
 
 
+def _live_egress(daemon: "Daemon", db: Database) -> str:
+    """The first enabled tunnel that is actually carrying traffic.
+
+    Testing through a tunnel that is down proves only that a dead tunnel is
+    blackholed - which is the kill switch doing its job - and the suite then
+    reports it as the worst result it has: "the test client could not reach
+    the internet at all", "1 CRITICAL FAILURE. Do not treat this gateway as
+    leak-proof". On a gateway with nothing wrong.
+
+    Found exactly that way. The first tunnel in the list had never completed
+    a handshake; the self-test picked it by position, and a gateway whose
+    every check passes against its live tunnel told its operator not to
+    trust it. A test that cries wolf is worse than none: it trains people to
+    ignore the one result that would matter.
+    """
+    enabled = db.tunnels(enabled_only=True)
+    if not enabled:
+        raise SystemExit("no enabled tunnel to test; pass --egress")
+    try:
+        status = daemon.call("/api/status")
+        live = {t["slug"] for t in status.get("tunnels", [])
+                if t.get("state") == "up" and t.get("routed")}
+    except Exception:
+        live = set()
+    for t in enabled:
+        if t.slug in live:
+            if t is not enabled[0]:
+                print(f"testing through {t.slug}: the first tunnel that is up "
+                      f"({enabled[0].slug} is not)\n")
+            return f"tunnel:{t.slug}"
+    raise SystemExit(
+        f"no tunnel is up ({', '.join(t.slug for t in enabled)}), so there is "
+        f"nothing to send test traffic through. That is not a leak: with no "
+        f"tunnel up the kill switch blocks every client, which is the point. "
+        f"Bring a tunnel up, or pass --egress to test a specific one anyway.")
+
+
 def cmd_selftest(args, db: Database, settings) -> int:
     daemon = Daemon(settings)
-    egress = args.egress
-    if not egress:
-        tunnels = db.tunnels(enabled_only=True)
-        if not tunnels:
-            raise SystemExit("no enabled tunnel to test; pass --egress")
-        egress = f"tunnel:{tunnels[0].slug}"
+    egress = args.egress or _live_egress(daemon, db)
     kind, _, slug = egress.partition(":")
 
     if args.disrupt:

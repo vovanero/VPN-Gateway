@@ -1885,9 +1885,21 @@ async function runSelftest(disrupt) {
   const enabled = s.tunnels.filter((t) => t.enabled);
   if (!enabled.length) { toast("err", "No enabled tunnel"); return; }
 
+  // Test through a tunnel that is up. Picking by position chose a tunnel that
+  // had never handshaken, and a gateway with nothing wrong reported "critical
+  // failures" - the kill switch correctly blackholing a dead tunnel, read as
+  // the worst result the suite has.
+  const target = enabled.find((t) => t.state === "up" && t.routed);
+  if (!target) {
+    toast("err", "No tunnel is up",
+      "There is nothing to send test traffic through. That is not a leak — " +
+      "with no tunnel up the kill switch blocks every client.");
+    return;
+  }
+
   if (disrupt) {
     const ok = await confirmDialog("Run the disruptive test?",
-      `'${enabled[0].name}' will actually be taken down while we measure whether anything escapes to the uplink. Clients on it lose connectivity for roughly twenty seconds.`,
+      `'${target.name}' will actually be taken down while we measure whether anything escapes to the uplink. Clients on it lose connectivity for roughly twenty seconds.`,
       "Run it");
     if (!ok) return;
   }
@@ -1897,7 +1909,7 @@ async function runSelftest(disrupt) {
 
   try {
     const res = await api("/api/selftest", "POST", {
-      egress_kind: "tunnel", egress_slug: enabled[0].slug, disrupt });
+      egress_kind: "tunnel", egress_slug: target.slug, disrupt });
     S.test = { status: "done", checks: res.checks, ok: res.ok, error: null,
                at: Date.now() / 1000 };
     toast(res.ok ? "ok" : "err",
