@@ -1,5 +1,21 @@
 # Changelog
 
+## 2.8.1 - updating from 2.7.1 brings redsocks too
+
+Updating a gateway from 2.7.1 to 2.8.0 left proxy exits unavailable: "redsocks
+could not be installed". The 2.7.1 `vpngw-update` runs the new release's
+installer, but it does not tell the installer which tunnel to fetch packages
+through - only 2.8.0's does - so the installer fell back to plain apt, which
+the armed kill switch blocks. And `vpngw-update` then said "already up to
+date", leaving nothing to run.
+
+- The installer now asks the installed gateway for a tunnel that is up when
+  nobody passed one, by the same test `vpngw-update` uses, and fetches through
+  it. An update from 2.7.1 straight to 2.8.1 installs redsocks.
+- `vpngw-update` on a gateway that is up to date but has no redsocks installs
+  the same release again, which fetches it - so the panel's advice, "vpngw-update
+  installs it", is true again.
+
 ## 2.8.0 - proxies as an exit
 
 A SOCKS5 or HTTP CONNECT proxy - a residential proxy, typically - can now be a

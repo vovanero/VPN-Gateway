@@ -1197,3 +1197,35 @@ class TheProxyDisruption(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RedsocksArrivesWithTheUpdate(unittest.TestCase):
+    """2.7.1's vpngw-update ran 2.8.0's installer without naming a tunnel; the
+    installer fell back to plain apt, the kill switch blocked it, and proxy
+    exits stayed unavailable with "already up to date" as the only answer."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def src(self, rel):
+        return (self.ROOT / rel).read_text(encoding="utf-8")
+
+    def test_the_installer_finds_a_tunnel_before_installing_anything(self):
+        script = self.src("install.sh")
+        self.assertLess(script.index("pick_fetch_tunnel\nMISSING=()"),
+                        script.index('for p in "${OPTIONAL_PKGS[@]}"'))
+
+    def test_a_tunnel_passed_in_is_kept(self):
+        script = self.src("install.sh")
+        picker = script[script.index("pick_fetch_tunnel() {"):script.index("install_missing() {")]
+        first = picker.splitlines()[1]
+        self.assertIn('-n "${VPNGW_FETCH_IFACE:-}"', first)
+        self.assertIn("return 0", first)
+
+    def test_up_to_date_without_redsocks_is_not_up_to_date(self):
+        script = self.src("scripts/update.sh")
+        branch = script[script.index('if [[ "v$CURRENT" == "$LATEST"'):]
+        branch = branch[:branch.index("\nfi\n")]
+        self.assertLess(branch.index("dpkg -s redsocks"), branch.index('ok "already up to date"'))
+
+if __name__ == "__main__":
+    unittest.main()

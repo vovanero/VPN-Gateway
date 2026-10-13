@@ -198,9 +198,21 @@ printf '    latest     %s\n' "$LATEST"
 [[ -n "$WANT_TAG" ]] && printf '    requested  %s\n' "$WANT_TAG"
 
 if [[ "v$CURRENT" == "$LATEST" || "$CURRENT" == "$LATEST" ]] && [[ -z "$WANT_TAG" ]]; then
-    ok "already up to date"
-    [[ "$MODE" == check ]] && exit 0
-    exit 0
+    # Up to date - unless a package the release needs never arrived. redsocks
+    # is fetched by the installer, and an update from 2.7.1 ran this release's
+    # installer without a tunnel to fetch through, so proxy exits stayed
+    # unavailable with nothing left to update to. Installing the same release
+    # again fetches it now, by the same safe path as any update.
+    if dpkg -s redsocks >/dev/null 2>&1; then
+        ok "already up to date"
+        exit 0
+    fi
+    warn "redsocks, which proxy exits need, is not installed"
+    if [[ "$MODE" == check ]]; then
+        warn "running vpngw-update again installs $LATEST anew and fetches it"
+        exit 0
+    fi
+    ok "installing $LATEST again to fetch it through $TUN_SLUG"
 fi
 
 if [[ "$MODE" == check ]]; then

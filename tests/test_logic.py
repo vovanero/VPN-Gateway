@@ -928,6 +928,14 @@ class EveryTunnelPickerWantsARoutedTunnel(unittest.TestCase):
         src = (self.ROOT / "scripts/update.sh").read_text(encoding="utf-8")
         self.assertIn(self.ROUTED, src)
 
+    def test_the_installer(self):
+        """It picks a tunnel itself when an older vpngw-update did not pass
+        one - and it must pick the same way."""
+        src = (self.ROOT / "install.sh").read_text(encoding="utf-8")
+        picker = src[src.index("pick_fetch_tunnel() {"):src.index("install_missing() {")]
+        self.assertIn(self.ROUTED, picker)
+        self.assertIn('t.kind.value == "proxy"', picker)
+
     def test_the_readme_bootstrap(self):
         src = (self.ROOT / "README.md").read_text(encoding="utf-8")
         boot = src[src.index("read -r IF NS"):]

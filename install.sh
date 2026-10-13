@@ -367,6 +367,44 @@ install_through_tunnel() {
     apt-get install --no-download -y -qq --no-install-recommends "$@"
 }
 
+# Which tunnel to fetch packages through, when the caller did not say.
+#
+# vpngw-update passes the tunnel it fetched the release through - but only
+# from 2.8.0 on. An older vpngw-update runs this installer without one, and
+# so does an installer run by hand; on a gateway that is already armed, plain
+# apt then only times out, because the kill switch blocks the box's own
+# egress. That is how every update from 2.7.1 left redsocks out. So ask the
+# installed gateway for a tunnel that is up, by the test vpngw-update uses.
+pick_fetch_tunnel() {
+    [[ -n "${VPNGW_FETCH_IFACE:-}" && -n "${VPNGW_FETCH_RESOLVER:-}" ]] && return 0
+    [[ -f "$PREFIX/vpngw/__init__.py" ]] || return 0
+    local picked
+    picked="$(PYTHONPATH="$PREFIX" python3 - 2>/dev/null <<'PY'
+from vpngw import config
+from vpngw.db import Database
+from vpngw.net import ifaces, routing
+
+settings = config.Settings.load()
+db = Database()
+try:
+    for t in db.tunnels(enabled_only=True):
+        # Never a proxy: curl --interface cannot route on its veth.
+        if t.kind.value == "proxy":
+            continue
+        if ifaces.exists(t.iface) and routing.table_default(t.table) == t.iface:
+            print(t.iface, settings.dns.resolver_ip(t.esid))
+            break
+finally:
+    db.close()
+PY
+)" || return 0
+    read -r VPNGW_FETCH_IFACE VPNGW_FETCH_RESOLVER <<<"$picked" || true
+    if [[ -n "${VPNGW_FETCH_IFACE:-}" && -n "${VPNGW_FETCH_RESOLVER:-}" ]]; then
+        export VPNGW_FETCH_IFACE VPNGW_FETCH_RESOLVER
+        ok "packages are fetched through $VPNGW_FETCH_IFACE"
+    fi
+}
+
 install_missing() {
     if [[ -n "${VPNGW_FETCH_IFACE:-}" && -n "${VPNGW_FETCH_RESOLVER:-}" ]]; then
         install_through_tunnel "$@"
@@ -375,6 +413,7 @@ install_missing() {
     fi
 }
 
+pick_fetch_tunnel
 MISSING=()
 for p in "${PKGS[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING+=("$p")
