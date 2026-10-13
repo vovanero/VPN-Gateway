@@ -1,5 +1,51 @@
 # Changelog
 
+## 2.8.0 - proxies as an exit
+
+A SOCKS5 or HTTP CONNECT proxy - a residential proxy, typically - can now be a
+client's exit, the way a tunnel is. It is always chained behind a WireGuard or
+OpenVPN tunnel: dialled directly, the proxy provider would see this gateway's
+real address and the proxy login would cross the ISP's wire in the clear, so
+there is no such mode and the model refuses to represent one.
+
+**How it stays inside the kill switch.** Each proxy egress gets its own network
+namespace, joined to the host by one veth, `px-<slug>`. The relay (redsocks)
+runs inside it, unprivileged, with lo and that veth as its only interfaces. A
+client's connection and the relay's connection to its server both cross the
+host's forward chain, so the kill switch applies to them unchanged - and a
+maintenance window, which opens only the host's own egress, cannot reach a
+single proxied byte. The relay may reach exactly one address and port, its
+server, and only through its entry tunnel; the host enforces that itself and
+does not take the namespace's word for it. The gateway's own output chain is
+byte-for-byte identical with or without proxies.
+
+**TCP only.** A SOCKS5 or HTTP proxy carries TCP. Client UDP on a proxy egress
+is refused with an ICMP error, so QUIC falls back to TCP at once; video calls,
+games and VoIP do not work on such an exit, and the panel says so before a
+client is assigned to one. DNS is resolved at the far end: the egress's
+resolver asks over UDP, and inside the namespace that becomes TCP through the
+proxy, so lookups exit where the traffic exits.
+
+**When it breaks, it says where.** The health probe is an HTTPS request through
+the relay, since ICMP does not cross a proxy. When it fails, a diagnosis run
+inside the namespace speaks the proxy's protocol itself and says whether the
+proxy did not answer, rejected the login, or refused to connect onward. The
+login reaches redsocks as a systemd credential and the diagnosis on stdin -
+never a command line - and no API returns it.
+
+**Bounded cost.** Residential proxies are usually billed by the byte, so once
+UP a proxy is re-measured every 30 s, and a DOWN one no more often: a dead
+proxy must not hold the reconcile loop that every other tunnel's failover runs
+in.
+
+redsocks is an optional package, installed through the tunnel `vpngw-update`
+fetches the release through, over HTTPS, and checked by apt against the signed
+index - on an armed gateway plain apt is blocked, and the plain-HTTP sources
+would have read the package names out to the ISP.
+
+Not in this release: proxies in pools, UDP, TLS to the proxy itself
+(`https://` proxy URLs), and Shadowsocks or Trojan.
+
 ## 2.7.1 - the updater picks a tunnel that works
 
 `vpngw-update` chose the first enabled tunnel whose interface existed. A
