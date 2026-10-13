@@ -773,7 +773,7 @@ input:user-invalid, select:user-invalid { border-color: var(--danger); }
   font-weight: 500;
   letter-spacing: .03em;
   text-transform: uppercase;
-  color: var(--muted);
+  color: var(--text-3);
 }
 
 /* The country label under an exit address. Quiet: the address is the fact,

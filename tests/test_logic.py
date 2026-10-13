@@ -837,5 +837,23 @@ class SelftestPicksALiveTunnel(unittest.TestCase):
         self.assertIn('t.state === "up" && t.routed', body)
 
 
+class StylesheetTokensExist(unittest.TestCase):
+    """Every var(--x) the panel uses must be a token the panel defines.
+
+    An undefined custom property is not an error anywhere: the browser drops
+    the declaration and the element inherits whatever colour is around it.
+    The "optional" tag on credential fields shipped that way in 2.4.0, styled
+    with a --muted that never existed, and looked fine only by accident.
+    """
+
+    def test_no_undefined_tokens(self):
+        css = (Path(__file__).resolve().parent.parent
+               / "vpngw/web/static/app.css").read_text(encoding="utf-8")
+        defined = set(re.findall(r"(--[a-z0-9-]+)\s*:", css))
+        used = set(re.findall(r"var\((--[a-z0-9-]+)", css))
+        self.assertEqual(sorted(used - defined), [],
+                         "these tokens are used but never defined")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
