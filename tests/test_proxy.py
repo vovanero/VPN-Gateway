@@ -162,5 +162,107 @@ class TheDatabase(unittest.TestCase):
         self.assertIn("UDP", str(caught.exception))
 
 
+class TheHostRuleset(unittest.TestCase):
+    """The proxy rules on the gateway, rendered.
+
+    The promise is unchanged: no client packet reaches the internet except
+    through a tunnel. These tests are about the four ways a proxy egress
+    could have quietly broken it - a new path to the uplink, a new hole in
+    the gateway's own egress, a relay reaching past its server, and UDP
+    finding a way around the proxy.
+    """
+
+    def setUp(self):
+        from vpngw.models import Client, EgressKind
+        self.nl = wg("nl01", 1, ["198.51.100.7"])
+        self.px = px("res-de1", 7)
+        self.px.endpoints = ["203.0.113.50"]
+        self.clients = [Client(name="pc5", ip="10.10.0.5",
+                               egress_kind=EgressKind.TUNNEL,
+                               egress_slug="res-de1")]
+
+    def render(self, tunnels=None, clients=None):
+        from vpngw.render import nftables
+        return nftables.render(config.Settings(),
+                               tunnels if tunnels is not None else [self.nl, self.px],
+                               [], clients if clients is not None else self.clients)
+
+    @staticmethod
+    def chain(text, name):
+        body = text[text.index(f"chain {name} {{"):]
+        return body[:body.index("\n    }\n")]
+
+    @staticmethod
+    def elements(text, decl):
+        block = text[text.index(decl):]
+        block = block[:block.index("}")]
+        return block.split("elements = {", 1)[1] if "elements = {" in block else ""
+
+    def test_the_rules_sit_where_the_kill_switch_needs_them(self):
+        fwd = self.chain(self.render(), "forward")
+        wan = fwd.index('"wan_leak_drop"')
+        nontcp = fwd.index('"proxy_nontcp_drop"')
+        accept = fwd.index('"forwarded_new"')
+        self.assertLess(wan, nontcp, "the uplink drop must come first")
+        self.assertLess(nontcp, accept,
+                        "UDP must be refused before client flows are accepted")
+
+    def test_the_gateways_own_egress_is_unchanged(self):
+        """No new host egress: a proxy's bytes are forwarded, never output."""
+        with_proxy = self.chain(self.render(), "output")
+        without = self.chain(self.render([self.nl], []), "output")
+        self.assertEqual(with_proxy, without)
+
+    def test_the_proxy_server_is_never_dialable_over_the_uplink(self):
+        from vpngw.render.nftables import wan_endpoints
+        self.assertNotIn("203.0.113.50", self.elements(self.render(), "set vpn_endpoints"))
+        self.assertNotIn("203.0.113.50", wan_endpoints([self.nl, self.px]))
+
+    def test_the_proxy_is_both_a_tunnel_and_a_proxy_interface(self):
+        text = self.render()
+        self.assertIn('"px-res-de1"', self.elements(text, "set tun_ifaces"))
+        self.assertIn('"px-res-de1"', self.elements(text, "set proxy_ifaces"))
+        self.assertNotIn('"wg-nl01"', self.elements(text, "set proxy_ifaces"))
+
+    def test_the_relay_is_steered_into_its_entry(self):
+        self.assertIn('"px-res-de1" : 0x0001', self.elements(self.render(), "map px_entry"))
+
+    def test_the_relay_may_reach_one_server(self):
+        self.assertEqual(self.elements(self.render(), "set px_upstream").strip(" }\n"),
+                         '"px-res-de1" . 203.0.113.50 . 1080')
+
+    def test_an_unresolved_server_means_no_way_out(self):
+        self.px.endpoints = []
+        self.assertEqual(self.elements(self.render(), "set px_upstream"), "")
+
+    def test_a_proxy_without_its_entry_is_left_out(self):
+        text = self.render([self.px])
+        self.assertEqual(self.elements(text, "set proxy_ifaces"), "")
+        self.assertEqual(self.elements(text, "set px_upstream"), "")
+
+    def test_a_disabled_proxy_is_left_out(self):
+        self.px.enabled = False
+        self.assertEqual(self.elements(self.render(), "set proxy_ifaces"), "")
+
+    def test_only_connections_the_namespace_starts_are_reclassified(self):
+        """Replies to clients share the interface; re-marking them would
+        overwrite the client flow's conntrack mark, which failover needs."""
+        mangle = " ".join(self.chain(self.render(), "mangle_prerouting").split())
+        self.assertIn("iifname @proxy_ifaces ct direction original "
+                      + chr(92) + " meta mark set iifname map @px_entry", mangle)
+        self.assertLess(mangle.index("@px_entry"),
+                        mangle.index("iifname != @client_ifaces return"))
+
+    def test_a_moved_server_rebuilds_the_ruleset(self):
+        from types import SimpleNamespace
+        from vpngw.reconciler import Reconciler
+        fake = SimpleNamespace(settings=config.Settings(),
+                               maintenance_active=lambda: False)
+        before = Reconciler._fingerprint(fake, [self.nl, self.px], [], [])
+        self.px.endpoints = ["203.0.113.51"]
+        after = Reconciler._fingerprint(fake, [self.nl, self.px], [], [])
+        self.assertNotEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main()

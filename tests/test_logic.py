@@ -440,10 +440,31 @@ class TestNftRender(unittest.TestCase):
                     "an accept in the forward chain is not restricted to tunnel "
                     "interfaces; this is how a split-tunnel hole gets introduced",
                 )
-        # And nothing may match on a destination address, which is the shape a
-        # bypass list would take.
-        for rule in chain:
-            self.assertNotIn("ip daddr", rule)
+        # And no destination match may let anything through, which is the
+        # shape a bypass list takes. A destination match whose only possible
+        # verdict is drop or reject narrows the chain instead - proxy egress
+        # uses one to hold each relay to its single server - so the rule is:
+        # a rule that looks at a destination must end the packet, and may
+        # never accept it, jump, or goto somewhere that could.
+        joined, rules = "", []
+        for line in chain:
+            joined = (joined + " " + line).strip() if joined else line
+            if line.endswith("\\"):
+                joined = joined[:-1].strip()
+                continue
+            if joined and not joined.startswith("#"):
+                rules.append(joined)
+            joined = ""
+        for rule in rules:
+            if "daddr" not in rule:
+                continue
+            with self.subTest(rule=rule):
+                for verdict in (" accept", " jump ", " goto "):
+                    self.assertNotIn(verdict, f" {rule} ",
+                                     "a destination match that can let traffic "
+                                     "through is a split-tunnel hole")
+                self.assertTrue(rule.endswith("drop") or " reject" in rule,
+                                "a destination match must end in drop or reject")
 
     def test_management_answers_on_exactly_the_admin_interfaces(self):
         settings = config.Settings(net=config.NetSettings(

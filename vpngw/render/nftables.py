@@ -25,7 +25,7 @@ it is the shape of the ruleset.
 from __future__ import annotations
 
 from ..config import Settings
-from ..models import Client, EgressKind, Pool, Tunnel
+from ..models import TunnelKind, Client, EgressKind, Pool, Tunnel
 
 HEADER = """\
 #!/usr/sbin/nft -f
@@ -74,6 +74,33 @@ def wan_endpoints(tunnels) -> set[str]:
     return {ep for t in tunnels if t.enabled and not t.via for ep in t.endpoints}
 
 
+def proxy_elements(tunnels) -> tuple[list[str], list[str], list[str]]:
+    """Elements of proxy_ifaces, px_entry and px_upstream, for enabled proxies.
+
+    One function, for the reason wan_endpoints is one: two copies of a
+    firewall rule drift, and the copy that drifts is the one nobody tests.
+
+    A proxy whose entry is missing is left out altogether, and so is the
+    server of one whose address is not known yet. Either way its namespace
+    can reach nothing, which is the failure this gateway prefers.
+    """
+    by_slug = {t.slug: t for t in tunnels}
+    ifaces: list[str] = []
+    entry: list[str] = []
+    upstream: list[str] = []
+    for t in tunnels:
+        if not t.enabled or t.kind is not TunnelKind.PROXY:
+            continue
+        parent = by_slug.get(t.via)
+        if parent is None:
+            continue
+        ifaces.append(f'"{t.iface}"')
+        entry.append(f'"{t.iface}" : {parent.esid:#06x}')
+        for addr in sorted(t.endpoints):
+            upstream.append(f'"{t.iface}" . {addr} . {int(t.proxy["port"])}')
+    return ifaces, entry, upstream
+
+
 def render(
     settings: Settings,
     tunnels: list[Tunnel],
@@ -119,6 +146,7 @@ def render(
         cli2dns.append(f"{c.ip} : {dns.resolver_ip(esid)}")
 
     endpoints = sorted(wan_endpoints(enabled_tunnels))
+    proxy_ifaces, px_entry, px_upstream = proxy_elements(tunnels)
     resolver_net = dns.resolver_subnet
 
     out: list[str] = [HEADER]
@@ -148,6 +176,9 @@ define RESOLVER_NET = {resolver_net}
     counter input_drop         { comment "unsolicited traffic to the gateway" }
     counter host_egress_drop   { comment "the gateway's own blocked egress" }
     counter dns_hijacked       { comment "client DNS queries redirected" }
+    counter proxy_nontcp_drop  { comment "non-TCP from a client on a proxy egress" }
+    counter proxy_upstream_drop { comment "a proxy namespace reaching past its server" }
+    counter proxy_upstream_new { comment "new connections from a proxy to its server" }
 
 """)
 
@@ -185,6 +216,23 @@ define RESOLVER_NET = {resolver_net}
     a(_elements(api_endpoints or ()))
     a("    }\n\n")
 
+    # Proxy egresses. Their interfaces are also in tun_ifaces, like every
+    # tunnel's; these three say what is special about them.
+    a("    set proxy_ifaces {\n        type ifname\n")
+    a("        comment \"proxy egresses: veths into their relay namespaces\"\n")
+    a(_elements(proxy_ifaces))
+    a("    }\n\n")
+
+    a("    map px_entry {\n        type ifname : mark\n")
+    a("        comment \"proxy egress -> the egress selector of its entry tunnel\"\n")
+    a(_elements(px_entry))
+    a("    }\n\n")
+
+    a("    set px_upstream {\n        type ifname . ipv4_addr . inet_service\n")
+    a("        comment \"the one server each proxy egress may reach\"\n")
+    a(_elements(px_upstream))
+    a("    }\n\n")
+
     a("    map cli2mark {\n        type ipv4_addr : mark\n")
     a("        comment \"client address -> egress selector\"\n")
     a(_elements(cli2mark))
@@ -199,6 +247,19 @@ define RESOLVER_NET = {resolver_net}
     a("""\
     chain mangle_prerouting {
         type filter hook prerouting priority mangle; policy accept;
+
+        # A proxy's relay reaches its server from inside its own namespace,
+        # so what it sends arrives here on px-<slug>. It is classified by that
+        # interface - which the namespace cannot change - into its entry
+        # tunnel's table; never by source address, which it could. Only
+        # connections the namespace starts: replies on their way back to a
+        # client arrive on the same interface, and re-marking those would
+        # overwrite the client flow's conntrack mark, which failover uses to
+        # find and flush it.
+        iifname @proxy_ifaces ct direction original \\
+            meta mark set iifname map @px_entry
+        iifname @proxy_ifaces ct direction original ct mark set meta mark
+        iifname @proxy_ifaces return
 
         # Only client-originated traffic needs an egress selector. Marking
         # replies arriving from a tunnel would send them straight back out of
@@ -250,6 +311,9 @@ define RESOLVER_NET = {resolver_net}
         iifname @tun_ifaces oifname @client_ifaces ct state established,related \\
             counter name "returned" accept
 
+        # Replies to a proxy's relay, coming back from its entry tunnel.
+        iifname @tun_ifaces oifname @proxy_ifaces ct state established,related accept
+
         # ------------------------------------------------------------------
         # KILL SWITCH. Everything past this point is client -> internet.
         # ------------------------------------------------------------------
@@ -265,14 +329,36 @@ define RESOLVER_NET = {resolver_net}
 
         ct state invalid counter name "invalid_drop" drop
 
-        # 3. Established client flows, already vetted by the rules below.
+        # 3. Clients on a proxy egress: TCP only. Refused with an ICMP error
+        #    rather than dropped, so QUIC gives up at once and the browser
+        #    falls back to TCP instead of waiting out a timeout. Nothing that
+        #    is refused here goes anywhere else: a proxy carries no UDP, and
+        #    there is no second route for it to take.
+        iifname @client_ifaces oifname @proxy_ifaces meta l4proto != tcp \\
+            counter name "proxy_nontcp_drop" reject with icmpx admin-prohibited
+
+        # 4. Established client flows, already vetted by the rules below.
         iifname @client_ifaces oifname @tun_ifaces ct state established,related accept
 
-        # 4. New client flows: must carry an egress selector. A client that is
+        # 5. New client flows: must carry an egress selector. A client that is
         #    unknown, disabled, or assigned to a disabled egress has mark 0 and
         #    falls through to the drop at the end.
         iifname @client_ifaces oifname @tun_ifaces meta mark != 0x0 ct state new \\
             counter name "forwarded_new" accept
+
+        # 6. A proxy's relay reaching its server through the entry tunnel.
+        #    Never into another proxy, TCP only, and only the one address and
+        #    port this proxy is configured for. The namespace's own ruleset
+        #    says the same; this does not take its word for it.
+        iifname @proxy_ifaces oifname @proxy_ifaces \\
+            counter name "proxy_upstream_drop" drop
+        iifname @proxy_ifaces meta l4proto != tcp \\
+            counter name "proxy_upstream_drop" drop
+        iifname @proxy_ifaces iifname . ip daddr . tcp dport != @px_upstream \\
+            counter name "proxy_upstream_drop" drop
+        iifname @proxy_ifaces oifname @tun_ifaces ct state established,related accept
+        iifname @proxy_ifaces oifname @tun_ifaces meta mark != 0x0 ct state new \\
+            counter name "proxy_upstream_new" accept
 
         counter name "unclassified_drop" drop
     }

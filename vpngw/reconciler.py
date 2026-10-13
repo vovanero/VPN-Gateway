@@ -147,6 +147,13 @@ class Reconciler:
         payload = {
             "tunnels": sorted((t.slug, t.iface, t.enabled, t.via)
                               for t in tunnels),
+            # A proxy's server address and port live in px_upstream, which is
+            # rendered whole rather than synced element by element - so a
+            # re-resolved address or a port edit has to rebuild, or the relay
+            # would be held to its old server until the next restart.
+            "proxies": sorted(
+                (t.slug, tuple(sorted(t.endpoints)), t.proxy.get("port"))
+                for t in tunnels if t.kind is TunnelKind.PROXY),
             "pools": sorted((p.slug, p.esid, p.enabled) for p in pools),
             "maintenance": self.maintenance_active(),
             "settings": [
