@@ -593,11 +593,16 @@ class TheReconciler(unittest.TestCase):
         self.addCleanup(setattr, reconciler, "try_run", reconciler.try_run)
         reconciler.os.listdir = lambda path: ["vpngw-px-old01", "vpngw-px-res-de1",
                                               "vpngw-test", "unrelated"]
+        from vpngw.tunnels import proxy
+        self.addCleanup(setattr, proxy, "try_run", proxy.try_run)
         reconciler.try_run = lambda argv, **kw: stopped.append(argv)
+        proxy.try_run = lambda argv, **kw: stopped.append(argv)
         reconciler.Reconciler._remove_orphan_namespaces({"vpngw-px-res-de1"})
         flat = [" ".join(a) for a in stopped]
         self.assertTrue(any("vpngw-proxy@old01.service" in a for a in flat))
-        self.assertIn("ip netns del vpngw-px-old01", flat)
+        # In the host's mount namespace - see HOST_MOUNTS - or the mount the
+        # daemon cannot see is the one left behind.
+        self.assertIn("nsenter --mount=/proc/1/ns/mnt -- ip netns del vpngw-px-old01", flat)
         self.assertFalse(any("res-de1" in a for a in flat), "removed a live proxy")
         self.assertFalse(any("vpngw-test" in a for a in flat),
                          "removed the self-test's namespace")
@@ -754,6 +759,40 @@ class TheApi(unittest.TestCase):
             body = api[start:api.index("\n    @app.", start)]
             for ret in [l for l in body.splitlines() if "return {" in l or '"password"' in l]:
                 self.assertNotIn('"password":', ret, f"{fn} returns a password")
+
+
+
+class TheNamespaceIsMadeWhereEveryoneCanSeeIt(unittest.TestCase):
+    """Found on the reference gateway: created from the sandboxed daemon, the
+    namespace's mount stayed in the daemon's private mount namespace, and the
+    relay units failed with "Failed to open network namespace path ...
+    Invalid argument". It must be made, and removed, in the host's."""
+
+    def setUp(self):
+        from vpngw.tunnels import proxy
+        self.proxy = proxy
+        self.calls = []
+        for name in ("run", "try_run"):
+            self.addCleanup(setattr, proxy, name, getattr(proxy, name))
+            setattr(proxy, name, lambda argv, **kw: self.calls.append(argv))
+        self.addCleanup(setattr, proxy.ProxyDriver, "_netns_ready",
+                        proxy.ProxyDriver._netns_ready)
+
+    def test_it_is_added_in_the_host_mount_namespace(self):
+        self.proxy.ProxyDriver._netns_ready = staticmethod(lambda name: False)
+        self.proxy.ProxyDriver()._netns_add("vpngw-px-res-de1")
+        self.assertIn(self.proxy.HOST_MOUNTS + ["ip", "netns", "add", "vpngw-px-res-de1"],
+                      self.calls)
+
+    def test_a_ready_namespace_is_left_alone(self):
+        self.proxy.ProxyDriver._netns_ready = staticmethod(lambda name: True)
+        self.proxy.ProxyDriver()._netns_add("vpngw-px-res-de1")
+        self.assertEqual(self.calls, [])
+
+    def test_removal_is_in_the_host_mount_namespace_too(self):
+        self.proxy.netns_del("vpngw-px-res-de1")
+        self.assertTrue(all(c[:len(self.proxy.HOST_MOUNTS)] == self.proxy.HOST_MOUNTS
+                            for c in self.calls))
 
 
 if __name__ == "__main__":

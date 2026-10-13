@@ -417,7 +417,7 @@ class Reconciler:
         relay unit and its config would outlive the egress - a relay holding a
         login for a proxy the operator has removed.
         """
-        from .tunnels.proxy import DNS_UNIT, RELAY_UNIT
+        from .tunnels.proxy import DNS_UNIT, RELAY_UNIT, netns_del
         import shutil
 
         try:
@@ -430,7 +430,7 @@ class Reconciler:
             slug = name[len(config.NETNS_PREFIX):]
             try_run(["systemctl", "stop", DNS_UNIT.format(slug=slug),
                      RELAY_UNIT.format(slug=slug)])
-            try_run(["ip", "netns", "del", name])
+            netns_del(name)
             shutil.rmtree(config.PROXY_RUNTIME / slug, ignore_errors=True)
             log.info("removed orphaned proxy namespace %s", name)
 

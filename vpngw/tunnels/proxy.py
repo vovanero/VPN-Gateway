@@ -47,6 +47,18 @@ from .base import LinkInfo, TunnelDriver, link_exists, link_state
 
 log = logging.getLogger("vpngw.proxy")
 
+#: Run a command in the host's mount namespace.
+#:
+#: The daemon runs sandboxed (ProtectHome, ProtectControlGroups), and systemd
+#: implements that with a private mount namespace. `ip netns add` works by
+#: bind-mounting the new namespace onto /run/netns/<name> - and done from in
+#: here, that mount stays in here. The daemon could use the namespace; the
+#: relay units, started by systemd from the host, saw an empty file and failed
+#: with "Failed to open network namespace path ... Invalid argument". Made in
+#: the host's namespace instead, the mount propagates into the daemon's too,
+#: because a service's mount namespace follows the host's.
+HOST_MOUNTS = ["nsenter", "--mount=/proc/1/ns/mnt", "--"]
+
 RELAY_UNIT = "vpngw-proxy@{slug}.service"
 DNS_UNIT = "vpngw-pxdns@{slug}.service"
 NS_IFACE = "px0"
@@ -200,6 +212,13 @@ def render_pxdns(upstreams: list[str]) -> str:
                        "upstreams": list(upstreams)}) + "\n"
 
 
+def netns_del(name: str) -> None:
+    """Remove a named namespace - mount and file - from the host's view."""
+    try_run(HOST_MOUNTS + ["ip", "netns", "del", name])
+    # ip netns del leaves a file that never had a namespace on it.
+    try_run(HOST_MOUNTS + ["rm", "-f", f"/run/netns/{name}"])
+
+
 # ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
@@ -219,8 +238,18 @@ class ProxyDriver(TunnelDriver):
         return run(["ip", "netns", "exec", t.netns, *argv], **kw)
 
     @staticmethod
-    def _netns_exists(name: str) -> bool:
-        return Path("/run/netns", name).exists()
+    def _netns_ready(name: str) -> bool:
+        """A real namespace, not just a file where one should be."""
+        return os.path.ismount(Path("/run/netns", name))
+
+    def _netns_add(self, name: str) -> None:
+        if self._netns_ready(name):
+            return
+        # A file with no namespace mounted on it - left by a failed attempt -
+        # would make `ip netns add` refuse with "File exists". Clear it first.
+        if Path("/run/netns", name).exists():
+            netns_del(name)
+        run(HOST_MOUNTS + ["ip", "netns", "add", name])
 
     def _upstreams(self, t: Tunnel) -> list[str]:
         # The same list the egress's dnsmasq asks, so the two agree on where
@@ -262,8 +291,7 @@ class ProxyDriver(TunnelDriver):
 
         # 1. The namespace, sealed before it has any way out: its ruleset is
         #    loaded while lo is its only interface.
-        if not self._netns_exists(t.netns):
-            run(["ip", "netns", "add", t.netns])
+        self._netns_add(t.netns)
         self._ns(t, "sysctl", "-qw", "net.ipv4.ip_forward=0")
         self._ns(t, "sysctl", "-qw", "net.ipv6.conf.all.disable_ipv6=1")
         self._ns(t, "sysctl", "-qw", "net.ipv6.conf.default.disable_ipv6=1")
@@ -301,7 +329,7 @@ class ProxyDriver(TunnelDriver):
         try_run(["ip", "link", "del", "dev", t.iface])
         try_run(["systemctl", "stop", DNS_UNIT.format(slug=t.slug),
                  RELAY_UNIT.format(slug=t.slug)])
-        try_run(["ip", "netns", "del", t.netns])
+        netns_del(t.netns)
         shutil.rmtree(self._runtime(t), ignore_errors=True)
 
     def state(self, t: Tunnel) -> LinkInfo:
