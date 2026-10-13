@@ -363,9 +363,93 @@ def cmd_tunnel_set(args, db: Database, settings) -> int:
     return 0
 
 
+def parse_proxy_url(url: str) -> dict:
+    """socks5://user@host:port or http://user@host:port, as fields.
+
+    A password in the URL is refused rather than used: a command line is
+    readable by every local account, in ps and in shell history alike.
+    """
+    from urllib.parse import unquote, urlsplit
+
+    try:
+        u = urlsplit(url)
+        port = u.port
+    except ValueError as exc:
+        raise SystemExit(f"that is not a proxy URL: {exc}")
+    scheme = (u.scheme or "").lower()
+    if scheme == "https":
+        raise SystemExit(
+            "https:// proxies - TLS to the proxy itself - are not supported "
+            "yet. If your provider also offers http://, use that: what you "
+            "reach through it is still HTTPS end to end.")
+    kind = {"socks5": "socks5", "socks5h": "socks5", "socks": "socks5",
+            "http": "http"}.get(scheme)
+    if not kind:
+        raise SystemExit(f"unsupported proxy scheme {scheme!r}: use socks5:// or http://")
+    if u.password:
+        raise SystemExit(
+            "leave the password out of the URL - a command line is readable "
+            "by every local account. You will be asked for it, or pass "
+            "--password-file.")
+    if not u.hostname or not port:
+        raise SystemExit("the URL needs a server and a port, "
+                         "e.g. socks5://user@gate.example.net:7000")
+    return {"type": kind, "host": u.hostname, "port": port,
+            "username": unquote(u.username or "")}
+
+
+def _proxy_password(args, username: str) -> str:
+    """From a file or a prompt, never from argv."""
+    if not username:
+        return ""
+    if getattr(args, "password_file", None):
+        return Path(args.password_file).read_text().strip("\r\n")
+    import getpass
+    return getpass.getpass(f"Password for {username}: ")
+
+
+def cmd_tunnel_add_proxy(args, db: Database, settings) -> int:
+    fields = parse_proxy_url(args.url)
+    password = _proxy_password(args, fields["username"])
+    res = Daemon(settings).call("/api/tunnels/proxy", "POST", {
+        "slug": args.slug, "name": args.name or args.slug, "via": args.via,
+        **fields, "password": password,
+    })
+    print(f"added {res['slug']}: {fields['type']} proxy routed through "
+          f"{res['via']}, interface {res['iface']}. TCP only: UDP from its "
+          f"clients is refused.")
+    if res.get("warning"):
+        print(colour("WARN", YELLOW), res["warning"])
+    print(f"check it with: vpngwctl tunnel test {res['slug']}")
+    return 0
+
+
+def cmd_tunnel_test(args, db: Database, settings) -> int:
+    res = Daemon(settings).call(f"/api/tunnels/{args.slug}/test", "POST", {},
+                                timeout=60)
+    if res.get("ok"):
+        where = f" · {res['country']}" if res.get("country") else ""
+        ms = f" · {res['ms']} ms" if res.get("ms") else ""
+        print(colour("OK", GREEN),
+              f"{res['message']} · exits as {res.get('exit_ip')}{where}{ms}")
+        return 0
+    print(colour("FAIL", RED), res.get("message", "the test failed"))
+    return 1
+
+
+def cmd_tunnel_login(args, db: Database, settings) -> int:
+    username = args.user or ""
+    password = _proxy_password(args, username)
+    Daemon(settings).call(f"/api/tunnels/{args.slug}", "PATCH",
+                          {"username": username, "password": password})
+    print(f"{args.slug}: login {'updated' if username else 'removed'}; the "
+          f"relay restarts with it on the next pass")
+    return 0
+
+
 def cmd_tunnel_rm(args, db: Database, settings) -> int:
     db.delete_tunnel(args.slug)
-    for suffix in (".json", ".ovpn", ".auth"):
+    for suffix in config.SECRET_SUFFIXES:
         (config.SECRETS_DIR / f"{args.slug}{suffix}").unlink(missing_ok=True)
     print(f"removed {args.slug}")
     Daemon(settings).nudge()
@@ -1060,6 +1144,32 @@ def build_parser() -> argparse.ArgumentParser:
     tr = t.add_parser("rm")
     tr.add_argument("slug")
     tr.set_defaults(func=cmd_tunnel_rm)
+
+    tp = t.add_parser(
+        "add-proxy",
+        help="add a SOCKS5 or HTTP proxy as an exit, behind a tunnel")
+    tp.add_argument("slug", help="short name; the interface becomes px-<slug>")
+    tp.add_argument("url", help="socks5://user@host:port or http://user@host:port"
+                                " - without the password")
+    tp.add_argument("--via", required=True, metavar="TUNNEL",
+                    help="the WireGuard or OpenVPN tunnel the proxy is reached "
+                         "through. Required: dialled directly, the proxy "
+                         "provider would see this gateway's real address.")
+    tp.add_argument("--name", help="human readable label")
+    tp.add_argument("--password-file",
+                    help="read the password from this file instead of asking")
+    tp.set_defaults(func=cmd_tunnel_add_proxy)
+
+    tt = t.add_parser("test", help="test a proxy now and say which link breaks")
+    tt.add_argument("slug")
+    tt.set_defaults(func=cmd_tunnel_test)
+
+    tl = t.add_parser("login", help="change a proxy's username and password")
+    tl.add_argument("slug")
+    tl.add_argument("--user", help="new username; omit to remove the login")
+    tl.add_argument("--password-file",
+                    help="read the password from this file instead of asking")
+    tl.set_defaults(func=cmd_tunnel_login)
 
     # -- provider ----------------------------------------------------------
     pv = sub.add_parser(

@@ -74,6 +74,10 @@ class Reconciler:
         # measured a broken one. A test that reports what it wanted to see is
         # worse than no test.
         self._held: set[str] = set()
+        # Tunnels whose device config must be rebuilt on the next pass - a
+        # proxy whose server or login changed. Requested from the API thread,
+        # carried out by the loop, so the two never touch a device at once.
+        self._reapply: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -259,6 +263,10 @@ class Reconciler:
 
     # -- 3. tunnels ---------------------------------------------------------
 
+    def request_reapply(self, slug: str) -> None:
+        """Rebuild a tunnel's device on the next pass (see _reapply)."""
+        self._reapply.add(slug)
+
     @contextmanager
     def hold(self, slugs):
         """Stop reconciling the named tunnels for the duration of the block.
@@ -354,6 +362,13 @@ class Reconciler:
                 continue
             if t.enabled:
                 expected.add(t.iface)
+                if t.slug in self._reapply:
+                    self._reapply.discard(t.slug)
+                    if ifaces.exists(t.iface):
+                        # Down, then straight back up below: the table falls
+                        # to its blackhole in between, never to the uplink.
+                        driver.down(t)
+                        self._link_info.pop(t.slug, None)
                 if not ifaces.exists(t.iface):
                     try:
                         self._link_info[t.slug] = driver.up(t)

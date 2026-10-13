@@ -71,6 +71,16 @@ def apply_log_level(name: str) -> None:
         _LOG_LEVELS.get(name.upper(), logging.CRITICAL + 10))
 
 
+def _proxy_row(t: Tunnel) -> dict:
+    from .tunnels.proxy import read_credentials
+    try:
+        username, password = read_credentials(t.slug)
+    except (OSError, ValueError):
+        username, password = "", ""
+    return {"proxy": dict(t.proxy), "username": username,
+            "has_password": bool(password)}
+
+
 class Service:
     def __init__(self, settings: config.Settings | None = None) -> None:
         self.settings = settings or config.Settings.load()
@@ -189,7 +199,7 @@ class Service:
 
     def snapshot(self) -> dict:
         """Everything the UI and CLI need, from one consistent read."""
-        from .models import EgressKind, HealthState
+        from .models import EgressKind, HealthState, TunnelKind
         from .net import nft, routing
 
         tunnels = self.db.tunnels()
@@ -241,6 +251,10 @@ class Service:
                 "dns": t.dns,
                 "mtu": t.mtu,
                 "notes": t.notes,
+                # Proxy egress: the server and the username. The password is
+                # not here and not anywhere else the panel can reach - only
+                # whether one is set, so "Change login" can say so.
+                **(_proxy_row(t) if t.kind is TunnelKind.PROXY else {}),
                 "routed": routing.table_default(t.table) == t.iface,
                 "rx_rate": latest.get("rx", 0),
                 "tx_rate": latest.get("tx", 0),
@@ -319,6 +333,12 @@ class Service:
                     "nontunnel_drop", {}).get("packets", 0),
                 "forwarded": counters.get("forwarded_new", {}).get("packets", 0),
                 "dns_hijacked": counters.get("dns_hijacked", {}).get("packets", 0),
+                # Client UDP refused on proxy egresses (TCP only), and anything
+                # a proxy's namespace tried to send past its one server.
+                "proxy_udp_refused": counters.get(
+                    "proxy_nontcp_drop", {}).get("packets", 0),
+                "proxy_upstream_blocked": counters.get(
+                    "proxy_upstream_drop", {}).get("packets", 0),
                 "strict_host_egress": self.settings.killswitch.strict_host_egress,
                 "maintenance": self.reconciler.maintenance_active(),
                 "maintenance_remaining": self.reconciler.maintenance_remaining(),

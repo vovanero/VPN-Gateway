@@ -30,9 +30,11 @@ from .models import (
     PoolMember,
     PoolStrategy,
     Tunnel,
+    HealthState,
     TunnelKind,
     ValidationError,
     normalise_slug,
+    validate_proxy,
 )
 
 log = logging.getLogger("vpngw.api")
@@ -318,16 +320,170 @@ def create_app(service) -> FastAPI:
         if "name" in body:
             t.name = str(body["name"])
         if "mtu" in body:
+            if t.kind is TunnelKind.PROXY:
+                raise HTTPException(
+                    status_code=400,
+                    detail="a proxy has no MTU of its own: the relay re-sends "
+                           "what it receives, and its entry tunnel's MTU "
+                           "applies to that")
             t.mtu = int(body["mtu"])
+        reapply = False
         if "via" in body:
             via = str(body["via"] or "").strip()
             try:
                 db.validate_via(t.slug, via)
             except ValidationError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
+            reapply = reapply or via != t.via
             t.via = via
+        proxy_fields = {"type", "host", "port"} & set(body)
+        login_fields = {"username", "password"} & set(body)
+        if (proxy_fields or login_fields) and t.kind is not TunnelKind.PROXY:
+            raise HTTPException(status_code=400,
+                                detail=f"{t.slug} is not a proxy")
+        if proxy_fields:
+            try:
+                t.proxy = validate_proxy({**t.proxy,
+                                          **{k: body[k] for k in proxy_fields}})
+            except ValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            if "host" in proxy_fields:
+                t.endpoints, t.endpoint_hosts = _resolve_proxy(t)
+            reapply = True
+        if login_fields:
+            from .tunnels import proxy as proxy_mod
+            current_user, current_password = proxy_mod.read_credentials(t.slug)
+            username = str(body.get("username", current_user))
+            # Blank means "keep what is there": the panel never has the
+            # current password to send back, by design.
+            password = str(body.get("password") or "") or (
+                current_password if username else "")
+            try:
+                proxy_mod.write_credentials(t.slug, username, password)
+            except ValidationError as exc:
+                raise HTTPException(status_code=400, detail=str(exc))
+            reapply = True
         db.update_tunnel(t)
+        if reapply and t.kind is TunnelKind.PROXY:
+            service.reconciler.request_reapply(t.slug)
         return touched()
+
+    def _resolve_proxy(t: Tunnel) -> tuple[list[str], list[str]]:
+        """A proxy server's name, looked up through its entry tunnel.
+
+        Never through the bootstrap DNS: that would tell the ISP which proxy
+        provider sits at the end of the chain.
+        """
+        from .importers import resolve_endpoints
+        parent = db.tunnel(t.via)
+        return resolve_endpoints(
+            [t.proxy["host"]],
+            via_resolver=settings.dns.resolver_ip(parent.esid) if parent else None,
+            offline=parent is None)
+
+    @app.post("/api/tunnels/proxy")
+    def add_proxy(body: dict = Body(...),
+                  x_vpngw_token: str | None = Header(default=None)) -> dict:
+        """Add a SOCKS5 or HTTP proxy as an exit, behind one of the tunnels.
+
+        The login arrives in the request body - never in the URL, where it
+        would end up in access logs - is written once to the 0600 secrets
+        file, and is returned by no endpoint, ever.
+        """
+        authorise(x_vpngw_token)
+        from .tunnels import proxy as proxy_mod
+
+        if not Path("/usr/sbin/redsocks").exists():
+            raise HTTPException(
+                status_code=400,
+                detail="redsocks is not installed, so proxy egress is not "
+                       "available yet. vpngw-update installs it, through a "
+                       "tunnel.")
+        username = str(body.get("username") or "")
+        password = str(body.get("password") or "")
+        try:
+            proxy = validate_proxy({"type": body.get("type"),
+                                    "host": body.get("host"),
+                                    "port": body.get("port")})
+            proxy_mod.validate_credentials(username, password)
+            t = Tunnel(slug=str(body.get("slug", "")).strip(),
+                       name=str(body.get("name") or body.get("slug") or ""),
+                       kind=TunnelKind.PROXY, esid=db.next_tunnel_esid(),
+                       via=str(body.get("via", "")).strip(), proxy=proxy,
+                       enabled=False)
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if db.tunnel(t.slug):
+            raise HTTPException(status_code=400,
+                                detail=f"a tunnel named {t.slug!r} already exists")
+        if db.tunnel(t.via) is None:
+            raise HTTPException(status_code=400,
+                                detail=f"no tunnel named {t.via!r} to route through")
+
+        t.endpoints, t.endpoint_hosts = _resolve_proxy(t)
+        # Born disabled, validated, then enabled: the reconcile loop must never
+        # find a proxy that has not passed validate_via.
+        db.add_tunnel(t)
+        try:
+            db.validate_via(t.slug, t.via)
+        except ValidationError as exc:
+            db.delete_tunnel(t.slug)
+            raise HTTPException(status_code=400, detail=str(exc))
+        proxy_mod.write_credentials(t.slug, username, password)
+        t.enabled = True
+        db.update_tunnel(t)
+        db.log_event("info", t.slug,
+                     f"proxy added ({proxy['type']}, routed through {t.via})")
+        touched()
+        return {
+            "slug": t.slug, "iface": t.iface, "via": t.via,
+            "resolved": bool(t.endpoints),
+            "warning": "" if t.endpoints else (
+                f"{proxy['host']} could not be resolved through {t.via} yet. "
+                f"The proxy comes up by itself once it can be."),
+        }
+
+    @app.post("/api/tunnels/{slug}/test")
+    def test_tunnel(slug: str,
+                    x_vpngw_token: str | None = Header(default=None)) -> dict:
+        """Test a proxy now, and say which link broke if it fails."""
+        authorise(x_vpngw_token)
+        from . import geo
+        from .net import ifaces
+        from .tunnels.proxy import ProxyDriver
+
+        t = db.tunnel(slug)
+        if not t:
+            raise HTTPException(status_code=404, detail="unknown tunnel")
+        if t.kind is not TunnelKind.PROXY:
+            raise HTTPException(status_code=400,
+                                detail="tunnels are measured continuously; "
+                                       "only a proxy has a test")
+        entry = db.tunnel(t.via)
+        entry_state = (service.reconciler.health.get(entry.slug).state
+                       if entry else None)
+        if entry is None or not entry.enabled or entry_state is HealthState.DOWN:
+            return {"ok": False, "stage": "entry",
+                    "message": f"{t.via} is down, so {t.slug} can't reach its proxy."}
+        driver = ProxyDriver()
+        if not t.endpoints:
+            return {"ok": False, "stage": "resolve",
+                    "message": driver.explain(t, {"stage": "resolve"})}
+        if not ifaces.exists(t.iface):
+            return {"ok": False, "stage": "relay",
+                    "message": "The proxy relay is not running yet. It starts "
+                               "within a few seconds of adding the proxy."}
+        ok, ms, exit_ip, reason = driver.probe(t)
+        if not ok:
+            d = driver.diagnose(t, fresh=True)
+            return {"ok": False, "stage": d.get("stage"),
+                    "message": driver.explain(t, d)}
+        country = geo.country_of(exit_ip)
+        return {"ok": True, "stage": "ok", "exit_ip": exit_ip,
+                "ms": round(ms) if ms else None,
+                "country": country[1] if country else None,
+                "country_code": country[0] if country else None,
+                "message": f"Works through {t.via}"}
 
     @app.delete("/api/tunnels/{slug}")
     def delete_tunnel(slug: str,
@@ -336,7 +492,7 @@ def create_app(service) -> FastAPI:
         if not db.tunnel(slug):
             raise HTTPException(status_code=404, detail="unknown tunnel")
         db.delete_tunnel(slug)
-        for suffix in (".json", ".ovpn", ".auth"):
+        for suffix in config.SECRET_SUFFIXES:
             (config.SECRETS_DIR / f"{slug}{suffix}").unlink(missing_ok=True)
         return touched()
 

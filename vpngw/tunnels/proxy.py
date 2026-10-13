@@ -53,7 +53,12 @@ NS_IFACE = "px0"
 NS_TABLE = "vpngw_px"
 LISTEN_TIMEOUT = 10
 PROBE_URL = "https://1.1.1.1/cdn-cgi/trace"
-PROBE_TIMEOUT = 8
+# The probe runs inside the reconcile loop. A dead proxy must not hold that
+# loop - and so every other tunnel's failover - for longer than this.
+PROBE_TIMEOUT = 5
+#: How long a diagnosis of a failing proxy is reused before asking again.
+DIAGNOSIS_TTL = 60
+_diagnoses: dict[str, tuple[float, dict]] = {}
 
 #: Characters redsocks can carry inside a quoted config string. Its format has
 #: no escaping, so a quote, backslash, semicolon or line break could end the
@@ -315,7 +320,46 @@ class ProxyDriver(TunnelDriver):
             return False, "the proxy relay is not running"
         return None, ""
 
-    def probe(self, t: Tunnel) -> tuple[bool, float | None, str | None]:
+    def diagnose(self, t: Tunnel, *, fresh: bool = False) -> dict:
+        """Which step of reaching the proxy fails, asked from inside the
+        namespace - through the entry tunnel, exactly as the relay goes.
+
+        The login travels on stdin, never on a command line.
+        """
+        if not t.endpoints:
+            return {"stage": "resolve", "ok": False, "detail": ""}
+        cached = _diagnoses.get(t.slug)
+        if not fresh and cached and time.time() - cached[0] < DIAGNOSIS_TTL:
+            return cached[1]
+        import sys
+        username, password = read_credentials(t.slug)
+        payload = json.dumps({"type": t.proxy["type"], "server": server_of(t),
+                              "port": int(t.proxy["port"]),
+                              "username": username, "password": password})
+        res = try_run(["ip", "netns", "exec", t.netns, sys.executable, "-m",
+                       "vpngw.proxycheck"], input_text=payload,
+                      timeout=PROBE_TIMEOUT + 4)
+        try:
+            result = json.loads(res.stdout)
+        except (ValueError, TypeError):
+            result = {"stage": "relay", "ok": False, "detail": ""}
+        _diagnoses[t.slug] = (time.time(), result)
+        return result
+
+    def explain(self, t: Tunnel, d: dict) -> str:
+        """A diagnosis in the panel's words. Never contains a credential."""
+        where = f"{t.proxy.get('host')}:{t.proxy.get('port')}"
+        return {
+            "resolve": f"{t.proxy.get('host')} couldn't be resolved through {t.via}.",
+            "connect": f"The proxy at {where} didn't answer through {t.via}.",
+            "auth": "The proxy rejected the username or password.",
+            "tunnel": "The proxy accepted the login but would not connect "
+                      f"onward: {d.get('detail') or 'no reason given'}.",
+            "ok": "The proxy answers, but the relay did not carry the probe.",
+        }.get(d.get("stage"), "The proxy relay stopped. It restarts by itself; "
+                              "clients stay blocked meanwhile.")
+
+    def probe(self, t: Tunnel) -> tuple[bool, float | None, str | None, str]:
         """An HTTP request from inside the namespace, through the relay.
 
         ICMP does not cross a proxy, so the usual ping cannot say anything
@@ -323,7 +367,8 @@ class ProxyDriver(TunnelDriver):
         after it enters the namespace - the relay, the entry tunnel, the
         proxy - and reports the proxy's exit address on the way.
 
-        Returns (ok, milliseconds, exit address).
+        Returns (ok, milliseconds, exit address, reason). The reason is
+        filled in only on failure, from a diagnosis of which step broke.
         """
         marker = "vpngw-probe-time="
         res = try_run(["ip", "netns", "exec", t.netns, "curl", "--silent",
@@ -331,7 +376,7 @@ class ProxyDriver(TunnelDriver):
                        "--write-out", "\n" + marker + "%{time_total}",
                        PROBE_URL], timeout=PROBE_TIMEOUT + 4)
         if not res.ok:
-            return False, None, None
+            return False, None, None, self.explain(t, self.diagnose(t))
         exit_ip, ms = None, None
         for line in res.stdout.splitlines():
             if line.startswith("ip="):
@@ -341,4 +386,7 @@ class ProxyDriver(TunnelDriver):
                     ms = float(line[len(marker):]) * 1000
                 except ValueError:
                     pass
-        return exit_ip is not None, ms, exit_ip
+        if exit_ip is None:
+            return False, ms, None, self.explain(t, self.diagnose(t))
+        _diagnoses.pop(t.slug, None)
+        return True, ms, exit_ip, ""

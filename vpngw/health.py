@@ -123,16 +123,21 @@ class HealthMonitor:
         # re-measured every probe_interval seconds; until then, every pass, so
         # a new proxy comes up promptly. The hint above runs every pass
         # regardless, so a dead relay is still noticed at once.
+        #
+        # DOWN is rate-limited too: a dead proxy's probe runs to its timeout,
+        # and the loop that waits for it is the one every other tunnel's
+        # failover runs in. Only a proxy still being measured for the first
+        # time is probed every pass, so a new one comes up promptly.
         interval = getattr(driver, "probe_interval", 0)
-        if (interval and h.state is HealthState.UP
+        if (interval and h.state in (HealthState.UP, HealthState.DOWN)
                 and now - h.last_sample < interval):
             return h
         probe = getattr(driver, "probe", None)
         if probe is not None:
-            ok, rtt, exit_ip = probe(t)
+            ok, rtt, exit_ip, reason = probe(t)
         else:
             ok, rtt = ping_via(t.iface, self.s.probe_target, self.s.probe_timeout)
-            exit_ip = None
+            exit_ip, reason = None, ""
         h.last_sample = now
         h.rtt_ms = rtt if ok else None
         if ok and exit_ip:
@@ -140,7 +145,7 @@ class HealthMonitor:
                 log.info("%s exit address is now %s", t.slug, exit_ip)
             h.exit_ip = exit_ip
             h.exit_ip_checked = now
-        return self._settle(h, ok, "" if ok else "probe timed out")
+        return self._settle(h, ok, "" if ok else (reason or "probe timed out"))
 
     def refresh_exit_ip(self, t: Tunnel) -> None:
         h = self.get(t.slug)

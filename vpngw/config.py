@@ -28,6 +28,10 @@ LOG = Path(os.environ.get("VPNGW_LOG", "/var/log/vpngw"))
 CONFIG_FILE = ETC / "vpngw.toml"
 DB_FILE = LIB / "vpngw.db"
 SECRETS_DIR = ETC / "secrets"            # 0700, holds private keys / auth files
+# Every file a tunnel can leave there, named <slug><suffix>. One list, because
+# deleting a tunnel from two places with two lists is how a proxy's login
+# would have outlived the proxy: neither list knew about ".proxy".
+SECRET_SUFFIXES = (".json", ".ovpn", ".auth", ".proxy")
 LOCAL_TOKEN = SECRETS_DIR / "local.token"  # root-only CLI credential
 KILLSWITCH_NFT = ETC / "killswitch.nft"  # boot-time fail-closed skeleton
 RUNTIME_NFT = RUN / "ruleset.nft"        # full generated ruleset

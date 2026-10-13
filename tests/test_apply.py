@@ -316,6 +316,50 @@ class TestServiceConstruction(unittest.TestCase):
         self.assertTrue(svc._wake.is_set())
         svc.stop()
 
+    def test_the_status_snapshot_builds_with_a_proxy(self):
+        """snapshot() is what /api/status serves, every three seconds.
+
+        It reached for TunnelKind without importing it, which no test noticed
+        because none called snapshot(); the first status request on a box with
+        a proxy would have been a 500, and vpngw-update would have rolled the
+        release back. This calls it - with a proxy, a login, and the password
+        checked to be absent from everything the panel receives.
+        """
+        import json
+        from vpngw import config
+        from vpngw.models import Tunnel, TunnelKind
+        from vpngw.tunnels import proxy
+
+        saved = config.SECRETS_DIR
+        config.SECRETS_DIR = Path(self.tmp.name) / "secrets"
+        self.addCleanup(lambda: setattr(config, "SECRETS_DIR", saved))
+
+        # The kernel is not part of this question - and there is no nft on a
+        # development machine - so every command "runs" and reports failure,
+        # which is the path snapshot() takes on a box whose tunnels are down.
+        from vpngw.net import shell
+        self.addCleanup(setattr, shell, "run", shell.run)
+        shell.run = lambda argv, **kw: shell.Result(argv, 1, "", "")
+
+        svc = self._service()
+        svc.db.add_tunnel(Tunnel(slug="nl01", name="NL", kind=TunnelKind.WIREGUARD,
+                                 esid=1, endpoints=["198.51.100.7"]))
+        svc.db.add_tunnel(Tunnel(slug="res-de1", name="Residential", esid=7,
+                                 kind=TunnelKind.PROXY, via="nl01",
+                                 endpoints=["203.0.113.50"],
+                                 proxy={"type": "socks5", "host": "gate.example.net",
+                                        "port": 7000}))
+        proxy.write_credentials("res-de1", "customer-7f3a", "hunter2-secret")
+
+        snap = svc.snapshot()
+        row = next(t for t in snap["tunnels"] if t["slug"] == "res-de1")
+        self.assertEqual(row["proxy"]["host"], "gate.example.net")
+        self.assertEqual(row["username"], "customer-7f3a")
+        self.assertTrue(row["has_password"])
+        self.assertNotIn("hunter2-secret", json.dumps(snap, default=str),
+                         "the proxy password reached the status snapshot")
+        self.assertIn("proxy_udp_refused", snap["killswitch"])
+
     def test_reload_settings_picks_up_a_changed_file(self):
         import dataclasses
         from vpngw import config

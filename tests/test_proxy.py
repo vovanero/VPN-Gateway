@@ -502,7 +502,7 @@ class TheHealthProbe(unittest.TestCase):
         self.mon = HealthMonitor(config.HealthSettings())
         self.t = px("res-de1", 7)
         self.calls = []
-        self.reply = (True, 612.0, "203.0.113.50")
+        self.reply = (True, 612.0, "203.0.113.50", "")
 
         def fake_probe(_self, t):
             self.calls.append(t.slug)
@@ -611,6 +611,149 @@ class TheReconciler(unittest.TestCase):
         src = (Path(__file__).resolve().parent.parent
                / "scripts/update.sh").read_text(encoding="utf-8")
         self.assertIn('if t.kind.value == "proxy":', src)
+
+
+class TheDiagnosis(unittest.TestCase):
+    """proxycheck tells the steps apart, against real sockets.
+
+    "It doesn't work" is not something an operator can fix; "the proxy
+    rejected the username or password" is. Each stage is driven here by a
+    small fake server speaking just enough of the protocol.
+    """
+
+    def serve(self, handler):
+        import socketserver
+        import threading
+        srv = socketserver.TCPServer(("127.0.0.1", 0), handler)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def check(self, kind, port, username="u1", password="p1"):
+        from vpngw import proxycheck
+        return proxycheck.check({"type": kind, "server": "127.0.0.1", "port": port,
+                                 "username": username, "password": password})
+
+    def socks(self, auth_ok=True, rep=0):
+        import socketserver
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                r = self.request
+                r.recv(3)                                # greeting
+                r.sendall(bytes([5, 2]))                 # user/pass, please
+                head = r.recv(2)
+                user = r.recv(head[1]); plen = r.recv(1)[0]; r.recv(plen)
+                r.sendall(bytes([1, 0 if auth_ok else 1]))
+                if not auth_ok:
+                    return
+                r.recv(10)                               # CONNECT, IPv4
+                r.sendall(bytes([5, rep, 0, 1]) + bytes(6))
+        return self.serve(H)
+
+    def http(self, code):
+        import socketserver
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(4096)
+                self.request.sendall(f"HTTP/1.1 {code} X\r\n\r\n".encode())
+        return self.serve(H)
+
+    def test_socks5_that_works(self):
+        self.assertEqual(self.check("socks5", self.socks())["stage"], "ok")
+
+    def test_socks5_login_rejected(self):
+        r = self.check("socks5", self.socks(auth_ok=False))
+        self.assertEqual((r["stage"], r["ok"]), ("auth", False))
+
+    def test_socks5_refusing_to_connect_onward(self):
+        r = self.check("socks5", self.socks(rep=2))
+        self.assertEqual(r["stage"], "tunnel")
+        self.assertIn("not allowed", r["detail"])
+
+    def test_http_proxy_stages(self):
+        for code, stage in ((200, "ok"), (407, "auth"), (403, "tunnel")):
+            with self.subTest(code=code):
+                self.assertEqual(self.check("http", self.http(code))["stage"], stage)
+
+    def test_nothing_listening_is_a_connect_failure(self):
+        import socket
+        s = socket.socket(); s.bind(("127.0.0.1", 0)); port = s.getsockname()[1]
+        s.close()                                        # a port nobody holds
+        self.assertEqual(self.check("socks5", port)["stage"], "connect")
+
+    def test_the_messages_never_carry_the_login(self):
+        from vpngw.tunnels.proxy import ProxyDriver
+        t = px("res-de1", 7, host="gate.example.net", port=7000)
+        for stage in ("resolve", "connect", "auth", "tunnel", "ok", "relay"):
+            msg = ProxyDriver().explain(t, {"stage": stage, "detail": "x"})
+            self.assertNotIn("p1-secret", msg)
+            self.assertTrue(msg.endswith("."), msg)
+
+
+class TheCommandLine(unittest.TestCase):
+
+    def test_a_proxy_url_becomes_fields(self):
+        from vpngw.cli import parse_proxy_url
+        self.assertEqual(parse_proxy_url("socks5://customer-7f3a@gate.example.net:7000"),
+                         {"type": "socks5", "host": "gate.example.net",
+                          "port": 7000, "username": "customer-7f3a"})
+        self.assertEqual(parse_proxy_url("http://u%40x@198.51.100.9:8080")["username"],
+                         "u@x")
+
+    def test_a_password_on_the_command_line_is_refused(self):
+        from vpngw.cli import parse_proxy_url
+        with self.assertRaises(SystemExit) as caught:
+            parse_proxy_url("socks5://user:hunter2@gate.example.net:7000")
+        self.assertNotIn("hunter2", str(caught.exception))
+
+    def test_unsupported_urls_are_refused(self):
+        from vpngw.cli import parse_proxy_url
+        for url in ("https://u@h:1", "socks4://h:1", "socks5://h", "h:1080"):
+            with self.subTest(url=url), self.assertRaises(SystemExit):
+                parse_proxy_url(url)
+
+
+class TheApi(unittest.TestCase):
+    """api.py imports FastAPI, which a development machine need not have, so
+    the invariants that matter are checked in its source."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def src(self, rel):
+        return (self.ROOT / rel).read_text(encoding="utf-8")
+
+    def test_deleting_a_tunnel_removes_its_login_too(self):
+        self.assertIn(".proxy", config.SECRET_SUFFIXES)
+        for rel in ("vpngw/api.py", "vpngw/cli.py"):
+            with self.subTest(rel=rel):
+                self.assertIn("for suffix in config.SECRET_SUFFIXES:", self.src(rel))
+                self.assertNotIn('(".json", ".ovpn", ".auth")', self.src(rel))
+
+    def test_a_new_proxy_is_validated_before_it_is_enabled(self):
+        api = self.src("vpngw/api.py")
+        body = api[api.index("def add_proxy("):api.index("def test_tunnel(")]
+        order = [body.index(step) for step in (
+            "db.add_tunnel(t)", "db.validate_via(t.slug, t.via)",
+            "proxy_mod.write_credentials(", "t.enabled = True")]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("enabled=False", body)
+
+    def test_the_server_name_is_looked_up_through_the_entry(self):
+        api = self.src("vpngw/api.py")
+        body = api[api.index("def _resolve_proxy("):api.index("def add_proxy(")]
+        self.assertIn("via_resolver=", body)
+        self.assertNotIn("getaddrinfo", body)
+
+    def test_no_endpoint_returns_the_password(self):
+        api = self.src("vpngw/api.py")
+        for fn in ("def add_proxy(", "def test_tunnel("):
+            start = api.index(fn)
+            body = api[start:api.index("\n    @app.", start)]
+            for ret in [l for l in body.splitlines() if "return {" in l or '"password"' in l]:
+                self.assertNotIn('"password":', ret, f"{fn} returns a password")
 
 
 if __name__ == "__main__":
