@@ -1,0 +1,52 @@
+[Unit]
+Description=vpngw proxy relay %i
+Requires=vpngw-killswitch.service
+After=vpngw-killswitch.service
+# Started only by the daemon, after it has built the namespace and written the
+# config. Never enabled: at boot neither exists yet, and a relay that started
+# on its own would be one the daemon had not sealed.
+ConditionPathExists=/run/vpngw/proxy/%i/redsocks.conf
+ConditionPathExists=/run/netns/vpngw-px-%i
+
+# Intentionally NOT PartOf=vpngw.service, for the same reason as the OpenVPN
+# units: restarting the control plane must not drop working connections. If
+# the relay dies while vpngw is down, nothing in its namespace can reach
+# anything but its server, and only through the forward chain.
+
+[Service]
+Type=simple
+# Inside the egress's own namespace. Its only interfaces are lo and px0.
+NetworkNamespacePath=/run/netns/vpngw-px-%i
+# Its own uid per instance, so one proxy can never read another's login.
+DynamicUser=yes
+# The login reaches redsocks as a credential: never on a command line, where
+# every local account could read it in ps.
+LoadCredential=redsocks.conf:/run/vpngw/proxy/%i/redsocks.conf
+ExecStart=/usr/sbin/redsocks -c %d/redsocks.conf
+Restart=always
+RestartSec=2
+StartLimitBurst=0
+
+# redsocks needs no privilege at all: it binds an unprivileged port and reads
+# SO_ORIGINAL_DST, which is open to any process.
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service

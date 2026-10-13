@@ -264,5 +264,233 @@ class TheHostRuleset(unittest.TestCase):
         self.assertNotEqual(before, after)
 
 
+class TheNamespace(unittest.TestCase):
+    """What runs inside vpngw-px-<slug>, and what it is allowed to do."""
+
+    def setUp(self):
+        self.t = px("res-de1", 7, host="gate.example.net", port=7000)
+        self.t.endpoints = ["203.0.113.50"]
+
+    def test_the_ruleset_replaces_whatever_was_there(self):
+        from vpngw.tunnels.proxy import render_namespace_ruleset
+        self.assertTrue(render_namespace_ruleset(self.t).startswith("flush ruleset"))
+
+    def test_there_is_exactly_one_way_out(self):
+        from vpngw.tunnels.proxy import render_namespace_ruleset
+        text = render_namespace_ruleset(self.t)
+        out = text[text.index("chain output {"):]
+        out = out[:out.index("}")]
+        accepts = [l.strip() for l in out.splitlines() if l.strip().endswith("accept")]
+        self.assertEqual(accepts, [
+            "oif lo accept",
+            "ct state established,related accept",
+            'oifname "px0" ip daddr 203.0.113.50 tcp dport 7000 accept',
+        ])
+        self.assertIn("policy drop", out)
+
+    def test_nothing_is_forwarded_inside(self):
+        from vpngw.tunnels.proxy import render_namespace_ruleset
+        text = render_namespace_ruleset(self.t)
+        fwd = text[text.index("chain forward {"):]
+        fwd = fwd[:fwd.index("}")]
+        self.assertEqual([l.strip() for l in fwd.splitlines()[1:] if l.strip()],
+                         ["type filter hook forward priority filter; policy drop;"])
+
+    def test_the_relay_is_not_redirected_into_itself(self):
+        from vpngw.tunnels.proxy import render_namespace_ruleset
+        text = render_namespace_ruleset(self.t)
+        nat = text[text.index("chain out_nat {"):]
+        self.assertLess(nat.index("ip daddr 203.0.113.50 tcp dport 7000 return"),
+                        nat.index("redirect to :"))
+
+    def test_redsocks_speaks_the_right_protocol(self):
+        from vpngw.tunnels.proxy import render_redsocks
+        self.assertIn("type = socks5;", render_redsocks(self.t, "", ""))
+        self.t.proxy["type"] = "http"
+        self.assertIn("type = http-connect;", render_redsocks(self.t, "", ""))
+
+    def test_redsocks_keeps_no_list_of_destinations(self):
+        from vpngw.tunnels.proxy import render_redsocks
+        conf = render_redsocks(self.t, "", "")
+        self.assertIn("log_info = off;", conf)
+        self.assertIn("log_debug = off;", conf)
+
+    def test_no_login_lines_without_a_login(self):
+        from vpngw.tunnels.proxy import render_redsocks
+        conf = render_redsocks(self.t, "", "")
+        self.assertNotIn("login", conf)
+        self.assertNotIn("password", conf)
+
+    def test_a_login_is_quoted(self):
+        from vpngw.tunnels.proxy import render_redsocks
+        conf = render_redsocks(self.t, "customer-7f3a", "p4ss-w0rd")
+        self.assertIn('login = "customer-7f3a";', conf)
+        self.assertIn('password = "p4ss-w0rd";', conf)
+
+
+class TheCredentials(unittest.TestCase):
+    """redsocks has no escaping, so the characters that could break out of a
+    quoted string are refused - and the refusal never repeats the value."""
+
+    def test_characters_that_could_inject_a_directive_are_refused(self):
+        from vpngw.tunnels.proxy import validate_credentials
+        for bad in ('pa"ss', "pa" + chr(92) + "ss", "pa;ss", "pa ss",
+                    "pa" + chr(10) + "ss", "pa" + chr(96) + "ss"):
+            with self.subTest(bad=bad), self.assertRaises(ValidationError) as caught:
+                validate_credentials("user", bad)
+            self.assertNotIn(bad, str(caught.exception))
+
+    def test_both_or_neither(self):
+        from vpngw.tunnels.proxy import validate_credentials
+        for user, pw in (("user", ""), ("", "pass")):
+            with self.subTest(user=user), self.assertRaises(ValidationError):
+                validate_credentials(user, pw)
+        validate_credentials("", "")                 # no auth is fine
+
+    def test_typical_residential_logins_pass(self):
+        from vpngw.tunnels.proxy import validate_credentials
+        validate_credentials("customer-7f3a_session-91.country-de", "Ab9#x!Qz@2")
+
+    def test_they_round_trip_through_the_secrets_file(self):
+        from vpngw.tunnels import proxy
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = config.SECRETS_DIR
+        config.SECRETS_DIR = Path(tmp.name)
+        self.addCleanup(setattr, config, "SECRETS_DIR", saved)
+        proxy.write_credentials("res-de1", "u1", "p1-secret")
+        self.assertEqual(proxy.read_credentials("res-de1"), ("u1", "p1-secret"))
+        if sys.platform != "win32":
+            mode = proxy.credentials_path("res-de1").stat().st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+        proxy.write_credentials("res-de1", "", "")   # clearing removes the file
+        self.assertFalse(proxy.credentials_path("res-de1").exists())
+
+
+class ThePxdnsForwarder(unittest.TestCase):
+    """UDP DNS in, TCP out, never a second path."""
+
+    QUERY = bytes.fromhex("123401000001000000000000076578616d706c6503636f6d0000010001")
+
+    def test_udp_limit_without_edns_is_512(self):
+        from vpngw.pxdns import udp_limit
+        self.assertEqual(udp_limit(self.QUERY), 512)
+
+    def test_udp_limit_reads_the_opt_record(self):
+        from vpngw.pxdns import udp_limit
+        q = bytearray(self.QUERY)
+        q[10:12] = (1).to_bytes(2, "big")                  # ARCOUNT = 1
+        q += bytes.fromhex("00" "0029" "1000" "00000000" "0000")  # OPT, 4096
+        self.assertEqual(udp_limit(bytes(q)), 4096)
+
+    def test_truncation_sets_tc_and_keeps_the_question(self):
+        from vpngw.pxdns import question_end, truncated
+        reply = bytearray(self.QUERY)
+        reply[2] |= 0x80                                   # QR
+        reply[6:8] = (1).to_bytes(2, "big")                # one answer
+        reply += b"\xc0\x0c" + bytes(10) + b"x" * 600
+        out = truncated(bytes(reply))
+        self.assertTrue(out[2] & 0x02, "TC not set")
+        self.assertEqual(out[6:12], bytes(6), "counts other than the question")
+        self.assertEqual(out[12:], bytes(reply[12:question_end(bytes(reply))]))
+
+    def test_it_asks_over_tcp_with_length_framing(self):
+        import socket
+        import socketserver
+        import struct
+        import threading
+        from vpngw import pxdns
+
+        class Answer(socketserver.BaseRequestHandler):
+            def handle(self):
+                n = struct.unpack("!H", self.request.recv(2))[0]
+                q = self.request.recv(n)
+                r = bytearray(q)
+                r[2] |= 0x80
+                self.request.sendall(struct.pack("!H", len(r)) + r)
+
+        srv = socketserver.TCPServer(("127.0.0.1", 0), Answer)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        real = socket.create_connection
+        port = srv.server_address[1]
+        self.addCleanup(setattr, socket, "create_connection", real)
+        socket.create_connection = lambda addr, timeout=None: real(("127.0.0.1", port), timeout)
+        reply = pxdns.ask_tcp("192.0.2.53", self.QUERY)
+        self.assertEqual(reply[:2], self.QUERY[:2])
+        self.assertTrue(reply[2] & 0x80)
+
+
+class TheDriver(unittest.TestCase):
+
+    def test_an_unresolved_server_is_refused_before_anything_runs(self):
+        from vpngw.tunnels import proxy
+        calls = []
+        self.addCleanup(setattr, proxy, "run", proxy.run)
+        proxy.run = lambda argv, **kw: calls.append(argv)
+        t = px("res-de1", 7)
+        with self.assertRaises(RuntimeError) as caught:
+            proxy.ProxyDriver().up(t)
+        self.assertEqual(calls, [])
+        self.assertIn("nl01", str(caught.exception))
+
+    def test_the_next_hop_is_the_namespace_end(self):
+        from vpngw.tunnels import proxy
+        from vpngw.tunnels.base import LinkInfo
+        self.addCleanup(setattr, proxy, "link_state", proxy.link_state)
+        proxy.link_state = lambda iface: LinkInfo(exists=True, up=True)
+        info = proxy.ProxyDriver().state(px("res-de1", 7))
+        self.assertEqual(info.gateway, config.proxy_link(7)[1])
+
+    def test_driver_for_knows_the_kind(self):
+        from vpngw.tunnels import driver_for
+        from vpngw.tunnels.proxy import ProxyDriver
+        self.assertIsInstance(driver_for(px("res-de1", 7)), ProxyDriver)
+
+
+class TheUnits(unittest.TestCase):
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def unit(self, name):
+        return (self.ROOT / "systemd" / name).read_text(encoding="utf-8")
+
+    def test_the_relay_is_jailed_and_unprivileged(self):
+        u = self.unit("vpngw-proxy@.service")
+        for line in ("NetworkNamespacePath=/run/netns/vpngw-px-%i",
+                     "DynamicUser=yes", "CapabilityBoundingSet=",
+                     "NoNewPrivileges=yes"):
+            self.assertIn(line + "\n", u)
+
+    def test_the_login_never_reaches_a_command_line(self):
+        u = self.unit("vpngw-proxy@.service")
+        self.assertIn("LoadCredential=redsocks.conf:", u)
+        exec_line = next(l for l in u.splitlines() if l.startswith("ExecStart="))
+        self.assertIn("%d/redsocks.conf", exec_line)
+        self.assertNotIn("password", exec_line.lower())
+
+    def test_neither_unit_starts_by_itself(self):
+        for name in ("vpngw-proxy@.service", "vpngw-pxdns@.service"):
+            with self.subTest(name=name):
+                self.assertNotIn("[Install]", self.unit(name))
+
+    def test_the_installer_treats_redsocks_as_optional(self):
+        import re
+        script = (self.ROOT / "install.sh").read_text(encoding="utf-8")
+        required = re.search(r"^PKGS=\((.*?)^\)", script, re.M | re.S).group(1)
+        self.assertNotIn("redsocks", required.split(),
+                         "a required redsocks would fail every update of an "
+                         "armed gateway that lacks it")
+        self.assertIn("OPTIONAL_PKGS=(redsocks)", script)
+        self.assertIn("systemctl mask redsocks.service", script)
+        for unit in ("vpngw-proxy@.service", "vpngw-pxdns@.service"):
+            self.assertIn(unit, script)
+
+    def test_updates_fetch_packages_through_the_tunnel(self):
+        script = (self.ROOT / "scripts/update.sh").read_text(encoding="utf-8")
+        self.assertIn('VPNGW_FETCH_IFACE="$TUN_IFACE"', script)
+
+
 if __name__ == "__main__":
     unittest.main()

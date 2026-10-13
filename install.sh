@@ -327,17 +327,73 @@ PKGS=(
 # switch armed that is not a no-op: host egress to the mirrors is dropped by
 # design, so `apt-get update` sits through its timeouts before carrying on.
 # An update that appears to hang is an update people interrupt.
+# Wanted but not essential: without it the gateway works and only proxy
+# egress is unavailable, so failing to get it must never fail an update.
+OPTIONAL_PKGS=(redsocks)
+
+# Debian's redsocks package ships its own service, which would start a relay
+# with a default config on the host at the next boot. vpngw runs redsocks only
+# inside a proxy egress's namespace, through its own unit, so the packaged one
+# is masked before the package can enable it.
+systemctl mask redsocks.service >/dev/null 2>&1 || true
+
+# Fetch .debs through a tunnel and let apt install them from its cache.
+#
+# On a gateway that is already running, the kill switch drops the box's own
+# traffic to the mirrors, so plain apt sits in timeouts - and if it did get
+# out, the sources are plain HTTP and the ISP would read the package names off
+# the wire ("this address just installed redsocks"). vpngw-update passes the
+# tunnel it fetched the release through; the files come over that tunnel, by
+# HTTPS, and `apt-get install --no-download` checks each one against the
+# signed index before using it, so a tampered file is refused by apt itself.
+# A fresh install has no kill switch and no tunnel yet, and uses plain apt.
+install_through_tunnel() {
+    local ip uri file https
+    ip=$(dig +short +time=3 +tries=2 deb.debian.org "@$VPNGW_FETCH_RESOLVER" \
+           2>/dev/null | grep -m1 -E '^[0-9.]+$')
+    [[ -n "$ip" ]] || return 1
+    while read -r uri file; do
+        # Both Debian hosts are served by deb.debian.org over HTTPS; anything
+        # else would need a lookup outside the tunnel, so it is refused.
+        https=$(printf '%s' "$uri" | sed \
+                  -e 's#^http://security\.debian\.org/#https://deb.debian.org/#' \
+                  -e 's#^http://#https://#')
+        [[ "$https" == https://deb.debian.org/* ]] || return 1
+        curl -sS --fail --max-time 180 --interface "$VPNGW_FETCH_IFACE" \
+             --resolve "deb.debian.org:443:$ip" \
+             -o "/var/cache/apt/archives/$file" "$https" || return 1
+    done < <(apt-get install --print-uris -qq -y --no-install-recommends "$@" \
+               2>/dev/null | awk '{print $1, $2}' | tr -d "'")
+    apt-get install --no-download -y -qq --no-install-recommends "$@"
+}
+
+install_missing() {
+    if [[ -n "${VPNGW_FETCH_IFACE:-}" && -n "${VPNGW_FETCH_RESOLVER:-}" ]]; then
+        install_through_tunnel "$@"
+    else
+        apt-get update -qq && apt-get install -y -qq "$@"
+    fi
+}
+
 MISSING=()
 for p in "${PKGS[@]}"; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING+=("$p")
 done
 if (( ${#MISSING[@]} )); then
-    apt-get update -qq
-    apt-get install -y -qq "${MISSING[@]}" || die "package installation failed"
+    install_missing "${MISSING[@]}" || die "package installation failed"
     ok "installed: ${MISSING[*]}"
 else
     ok "all packages already present"
 fi
+
+for p in "${OPTIONAL_PKGS[@]}"; do
+    dpkg -s "$p" >/dev/null 2>&1 && continue
+    if install_missing "$p" >/dev/null 2>&1; then
+        ok "installed: $p"
+    else
+        warn "$p could not be installed; proxy egress is unavailable until it is"
+    fi
+done
 
 # Installed is not the same as reachable. Check the binaries themselves, so a
 # PATH or a half-removed package is caught here rather than three steps later
@@ -557,7 +613,8 @@ fi
 # ---------------------------------------------------------------------------
 say "systemd units"
 
-for unit in vpngw-killswitch.service vpngw.service vpngw-ovpn@.service vpngw-dns@.service; do
+for unit in vpngw-killswitch.service vpngw.service vpngw-ovpn@.service \
+            vpngw-dns@.service vpngw-proxy@.service vpngw-pxdns@.service; do
     install -m 0644 "$SRC/systemd/$unit" "/etc/systemd/system/$unit"
 done
 

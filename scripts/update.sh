@@ -275,7 +275,11 @@ ok "$CURRENT returns in $ROLLBACK_MINUTES minutes unless this run confirms"
 say "installing $TARGET"
 # The installer keeps /etc/vpngw/vpngw.toml and never touches the database,
 # so an update preserves tunnels, clients and the panel password.
-if VPNGW_NONINTERACTIVE=1 "$SRC/install.sh"; then
+# The tunnel the release came through is also how any missing package comes
+# in: on an armed gateway plain apt is blocked, and over plain HTTP it would
+# read the package names out to the ISP.
+if VPNGW_NONINTERACTIVE=1 VPNGW_FETCH_IFACE="$TUN_IFACE" \
+   VPNGW_FETCH_RESOLVER="$RESOLVER" "$SRC/install.sh"; then
     ok "installer finished"
 else
     warn "the installer failed - restoring $CURRENT now rather than waiting"

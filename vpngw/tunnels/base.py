@@ -79,8 +79,13 @@ class TunnelDriver:
 
 def driver_for(t: Tunnel) -> TunnelDriver:
     from .ovpn import OpenVpnDriver
+    from .proxy import ProxyDriver
     from .wg import WireGuardDriver
 
-    return (
-        WireGuardDriver() if t.kind is TunnelKind.WIREGUARD else OpenVpnDriver()
-    )
+    # Explicit per kind. This used to treat everything that was not WireGuard
+    # as OpenVPN, which a third kind would have inherited silently.
+    return {
+        TunnelKind.WIREGUARD: WireGuardDriver,
+        TunnelKind.OPENVPN: OpenVpnDriver,
+        TunnelKind.PROXY: ProxyDriver,
+    }[t.kind]()

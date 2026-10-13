@@ -153,8 +153,8 @@ def physical_names() -> set[str]:
     try:
         for name in os.listdir("/sys/class/net"):
             if name == "lo" or name.startswith(
-                    (config.WG_PREFIX, config.OVPN_PREFIX, "veth", "docker",
-                     "virbr", config.DUMMY_IFACE)):
+                    (config.WG_PREFIX, config.OVPN_PREFIX, config.PROXY_PREFIX,
+                     "veth", "docker", "virbr", config.DUMMY_IFACE)):
                 continue
             if os.path.exists(f"/sys/class/net/{name}/device"):
                 out.add(name)
@@ -170,7 +170,8 @@ def tunnel_ifaces() -> set[str]:
     try:
         for entry in json.loads(res.stdout or "[]"):
             name = entry.get("ifname", "")
-            if name.startswith((config.WG_PREFIX, config.OVPN_PREFIX)):
+            if name.startswith((config.WG_PREFIX, config.OVPN_PREFIX,
+                                config.PROXY_PREFIX)):
                 out.add(name)
     except ValueError:
         pass

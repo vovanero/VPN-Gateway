@@ -1,0 +1,41 @@
+[Unit]
+Description=vpngw proxy DNS forwarder %i
+# Without the relay its TCP has nowhere to go; with this it stops with it.
+BindsTo=vpngw-proxy@%i.service
+After=vpngw-proxy@%i.service
+ConditionPathExists=/run/vpngw/proxy/%i/pxdns.json
+ConditionPathExists=/run/netns/vpngw-px-%i
+
+[Service]
+Type=simple
+NetworkNamespacePath=/run/netns/vpngw-px-%i
+DynamicUser=yes
+LoadCredential=pxdns.json:/run/vpngw/proxy/%i/pxdns.json
+# Standard library only; the vpngw package is imported for its namespace and
+# nothing else, so the system interpreter is enough even on a venv install.
+Environment=PYTHONPATH=/opt/vpngw
+ExecStart=/usr/bin/python3 -m vpngw.pxdns %d/pxdns.json
+Restart=always
+RestartSec=2
+StartLimitBurst=0
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
