@@ -15,6 +15,7 @@ blocks, so provider-specific crypto settings keep working.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 
 # Directives removed from the provider's file. Each is reissued below, or
@@ -76,6 +77,62 @@ def strip_provider_config(text: str) -> tuple[str, list[str]]:
     return "\n".join(out) + "\n", removed
 
 
+REMOTE_RE = re.compile(r"^(\s*remote\s+)(\S+)(.*)$")
+
+
+def _is_name(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return True
+    return False
+
+
+def pin_remotes(body: str, addresses: list[str]) -> str:
+    """Replace hostname ``remote`` lines with the given addresses.
+
+    OpenVPN resolves a hostname remote itself, through the system resolver:
+    the bootstrap DNS, over the uplink. For a chained tunnel that asks the ISP
+    for the exit provider's name on every connect. The caller passes the
+    addresses vpngw resolved through the parent instead; every named remote
+    becomes one ``remote <address> ...`` per address, keeping its port and
+    protocol, and literal remotes are left exactly as they were.
+
+    Raises ValueError when there are named remotes and no addresses - the
+    tunnel must not start rather than start by asking the uplink.
+    """
+    lines = body.splitlines()
+    named = [i for i, line in enumerate(lines)
+             if (m := REMOTE_RE.match(line)) and _is_name(m.group(2))]
+    if not named:
+        return body
+    # The caller's list holds every endpoint, literal remotes included; only
+    # the addresses that stand in for names belong in the pinned lines.
+    literal = {m.group(2).strip("[]") for line in lines
+               if (m := REMOTE_RE.match(line)) and not _is_name(m.group(2))}
+    addresses = [a for a in addresses if a not in literal]
+    if not addresses:
+        if literal:
+            # Names unresolved, but there are literal remotes to use: drop
+            # the named lines rather than let OpenVPN resolve them.
+            kept = [l for i, l in enumerate(lines) if i not in named]
+            return "\n".join(kept) + ("\n" if body.endswith("\n") else "")
+        raise ValueError(
+            "named remotes but no address resolved through the parent; "
+            "refusing to let OpenVPN look the name up over the uplink")
+    first = REMOTE_RE.match(lines[named[0]])
+    pinned = [f"{first.group(1)}{addr}{first.group(3)}" for addr in addresses]
+    out = []
+    for i, line in enumerate(lines):
+        if i == named[0]:
+            out.extend(pinned)
+        elif i in named:
+            continue  # every resolved address is already listed above
+        else:
+            out.append(line)
+    return "\n".join(out) + ("\n" if body.endswith("\n") else "")
+
+
 def render(
     provider_config: str,
     *,
@@ -86,8 +143,11 @@ def render(
     mtu: int = 0,
     fwmark: int = 0,
     verb: int = 3,
+    remotes: list[str] | None = None,
 ) -> tuple[str, list[str]]:
     body, removed = strip_provider_config(provider_config)
+    if remotes is not None:
+        body = pin_remotes(body, remotes)
 
     ours = [
         "",

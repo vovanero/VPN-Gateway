@@ -384,9 +384,6 @@ class TestOpenvpnMark(unittest.TestCase):
         self.assertNotIn("\nmark ", plain)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class TestProviderLogoutRoute(unittest.TestCase):
     """The panel's Remove account button had no endpoint behind it.
@@ -499,3 +496,220 @@ class TestImportBornChained(unittest.TestCase):
         self.assertIsNotNone(guard, "no validation guard around via")
         self.assertNotIn("tunnel.enabled = True", guard.group(1),
                          "the failure path enables the tunnel anyway")
+
+
+class RiderEndpointsStayOffTheWan(unittest.TestCase):
+    """A chained tunnel's endpoint must never be dialable over the uplink.
+
+    The full render and the incremental sync used to build @vpn_endpoints
+    separately, and only the sync left riders out. Every structural rebuild
+    therefore put the exit provider's address on the WAN allow-list for one
+    reconcile pass - a window in which a misrouted handshake would have shown
+    the exit provider this gateway's real address.
+    """
+
+    def setUp(self):
+        self.entry = wg("nl01", 1, endpoints=["198.51.100.7"])
+        self.rider = wg("ch01", 2, endpoints=["192.0.2.88"], via="nl01")
+
+    def test_the_shared_definition_leaves_riders_out(self):
+        from vpngw.render.nftables import wan_endpoints
+        self.assertEqual(wan_endpoints([self.entry, self.rider]),
+                         {"198.51.100.7"})
+
+    def test_disabled_tunnels_are_left_out_too(self):
+        from vpngw.render.nftables import wan_endpoints
+        self.entry.enabled = False
+        self.assertEqual(wan_endpoints([self.entry, self.rider]), set())
+
+    def test_the_full_render_agrees(self):
+        from vpngw.render import nftables
+        text = nftables.render(config.Settings(), [self.entry, self.rider], [], [])
+        block = text[text.index("set vpn_endpoints"):]
+        block = block[:block.index("}")]
+        self.assertIn("198.51.100.7", block)
+        self.assertNotIn("192.0.2.88", block,
+                         "a rider's endpoint is on the WAN allow-list")
+
+    def test_the_sync_uses_the_same_definition(self):
+        """Two copies of this rule is how the bug happened; keep it one."""
+        src = (Path(__file__).resolve().parent.parent
+               / "vpngw/reconciler.py").read_text(encoding="utf-8")
+        self.assertIn('nft.sync_set("vpn_endpoints", render_nft.wan_endpoints(', src)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class ChainedNamesNeverAskTheUplink(unittest.TestCase):
+    """A chained tunnel's server name must not be looked up over the uplink.
+
+    That lookup tells the ISP, in plaintext, which exit provider sits behind
+    the first hop - the one fact a double VPN exists to hide. It happened in
+    three places: vpngw's own resolution at import and every fifteen minutes,
+    wg(8) resolving a hostname Endpoint itself, and OpenVPN resolving a
+    hostname remote itself. Each is pinned here.
+    """
+
+    def _fake_dig(self, answer="192.0.2.88\n", ok=True):
+        import vpngw.net.shell as shell
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append(argv)
+            return type("R", (), {"ok": ok, "stdout": answer})
+
+        self.addCleanup(setattr, shell, "try_run", shell.try_run)
+        shell.try_run = fake
+        return calls
+
+    def _no_system_resolver(self):
+        import vpngw.importers as imp
+        self.addCleanup(setattr, imp.socket, "getaddrinfo", imp.socket.getaddrinfo)
+
+        def refuse(*a, **k):
+            raise AssertionError("asked the system resolver - that is the uplink")
+
+        imp.socket.getaddrinfo = refuse
+
+    def test_a_chained_name_is_asked_of_the_parent_resolver(self):
+        from vpngw.importers import resolve_endpoints
+        calls = self._fake_dig()
+        self._no_system_resolver()
+        addrs, names = resolve_endpoints(["exit.example.net"],
+                                         via_resolver="10.99.0.1")
+        self.assertEqual(addrs, ["192.0.2.88"])
+        self.assertEqual(names, ["exit.example.net"])
+        self.assertIn("@10.99.0.1", calls[0])
+
+    def test_a_failed_lookup_does_not_fall_back_to_the_uplink(self):
+        from vpngw.importers import resolve_endpoints
+        self._fake_dig(answer="", ok=False)
+        self._no_system_resolver()
+        addrs, _ = resolve_endpoints(["exit.example.net"],
+                                     via_resolver="10.99.0.1")
+        self.assertEqual(addrs, [])
+
+    def test_offline_resolves_nothing(self):
+        from vpngw.importers import resolve_endpoints
+        calls = self._fake_dig()
+        self._no_system_resolver()
+        addrs, names = resolve_endpoints(["exit.example.net", "198.51.100.9"],
+                                         offline=True)
+        self.assertEqual(addrs, ["198.51.100.9"])
+        self.assertEqual(names, ["exit.example.net"])
+        self.assertEqual(calls, [])
+
+    # -- WireGuard --------------------------------------------------------
+
+    def _spec(self, endpoint):
+        return {"private_key": "k" * 43 + "=",
+                "peers": [{"public_key": "p" * 43 + "=", "endpoint": endpoint}]}
+
+    def _setconf(self, t, spec):
+        from vpngw.tunnels.wg import WireGuardDriver
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        saved = config.WG_RUNTIME
+        config.WG_RUNTIME = Path(tmp.name)
+        self.addCleanup(lambda: setattr(config, "WG_RUNTIME", saved))
+        path = WireGuardDriver()._write_setconf(t, spec)
+        text = path.read_text()
+        path.unlink()
+        return text
+
+    def test_wg_gets_the_resolved_address_not_the_name(self):
+        t = wg("ch01", 2, endpoints=["192.0.2.88"], via="nl01")
+        text = self._setconf(t, self._spec("exit.example.net:51820"))
+        self.assertIn("Endpoint = 192.0.2.88:51820", text)
+        self.assertNotIn("exit.example.net", text)
+
+    def test_wg_refuses_a_chained_name_it_cannot_place(self):
+        from vpngw.tunnels.wg import WireGuardDriver
+        t = wg("ch01", 2, endpoints=[], via="nl01")
+        with self.assertRaises(RuntimeError) as caught:
+            WireGuardDriver()._check_chained_endpoints(
+                t, self._spec("exit.example.net:51820"))
+        self.assertIn("over the uplink", str(caught.exception))
+
+    def test_wg_unchained_names_are_left_alone(self):
+        """Unchained tunnels dial over the uplink anyway; nothing changes."""
+        t = wg("nl01", 1, endpoints=["198.51.100.7"])
+        text = self._setconf(t, self._spec("nl.example.net:51820"))
+        self.assertIn("Endpoint = nl.example.net:51820", text)
+
+    def test_wg_literal_endpoints_are_untouched(self):
+        t = wg("ch01", 2, endpoints=["192.0.2.88"], via="nl01")
+        text = self._setconf(t, self._spec("192.0.2.88:51820"))
+        self.assertIn("Endpoint = 192.0.2.88:51820", text)
+
+    # -- OpenVPN ----------------------------------------------------------
+
+    BODY = ("client\n"
+            "remote exit.example.net 1194 udp\n"
+            "remote 198.51.100.9 443 tcp\n"
+            "remote exit2.example.net 1194 udp\n")
+
+    def test_ovpn_named_remotes_become_addresses(self):
+        from vpngw.render.openvpn import pin_remotes
+        out = pin_remotes(self.BODY, ["192.0.2.88", "192.0.2.89", "198.51.100.9"])
+        self.assertNotIn("example.net", out)
+        self.assertIn("remote 192.0.2.88 1194 udp", out)
+        self.assertIn("remote 192.0.2.89 1194 udp", out)
+        self.assertEqual(out.count("198.51.100.9"), 1,
+                         "a literal remote was duplicated")
+
+    def test_ovpn_keeps_literals_when_names_are_unresolved(self):
+        from vpngw.render.openvpn import pin_remotes
+        out = pin_remotes(self.BODY, ["198.51.100.9"])
+        self.assertNotIn("example.net", out)
+        self.assertIn("remote 198.51.100.9 443 tcp", out)
+
+    def test_ovpn_refuses_when_nothing_safe_is_left(self):
+        from vpngw.render.openvpn import pin_remotes
+        with self.assertRaises(ValueError):
+            pin_remotes("client\nremote exit.example.net 1194 udp\n", [])
+
+    def test_ovpn_driver_pins_only_chained_tunnels(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "vpngw/tunnels/ovpn.py").read_text(encoding="utf-8")
+        self.assertIn("remotes=list(t.endpoints) if t.via else None", src)
+
+
+class UnknownTunnelKindsAreSkipped(unittest.TestCase):
+    """A row this version does not understand must not stop the daemon.
+
+    Rolling back past the release that adds proxy egress leaves 'proxy' rows
+    behind. TunnelKind('proxy') used to raise inside db.tunnels(), every
+    reconcile pass failed, and the daemon could not start - fail-closed, but
+    a total outage for a rollback. Skipped instead: the row's interface is
+    never built, so its clients have no egress and are dropped.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = Database(Path(tmp.name) / "t.db")
+        self.addCleanup(self.db.close)
+        self.db.add_tunnel(wg("nl01", 1, ["198.51.100.7"]))
+        # Exactly what a newer version would have written.
+        self.db._x(
+            "INSERT INTO tunnel (slug, name, kind, esid, enabled, config_path,"
+            " mtu, dns, endpoints, endpoint_hosts, via, notes, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("res-de1", "Residential", "proxy", 2, 1, "", 0,
+             "[]", "[]", "[]", "nl01", "", 0))
+
+    def test_listing_survives_a_kind_from_the_future(self):
+        self.assertEqual([t.slug for t in self.db.tunnels()], ["nl01"])
+        self.assertEqual([t.slug for t in self.db.tunnels(enabled_only=True)],
+                         ["nl01"])
+
+    def test_looking_it_up_finds_nothing_rather_than_raising(self):
+        self.assertIsNone(self.db.tunnel("res-de1"))
+
+    def test_its_esid_stays_reserved(self):
+        """A new tunnel must not reuse the number, or both would route alike."""
+        t = self.db.add_tunnel(wg("ch01", 0))
+        self.assertNotEqual(t.esid, 2)

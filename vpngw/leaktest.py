@@ -171,6 +171,18 @@ class LeakTest:
         self._ns("timeout", "3", "curl", "--silent", "--max-time", "2",
                  "http://" + CANARY_HOST, timeout=6)
 
+    def _resolver_addresses(self) -> list[str]:
+        """Every resolver a client could name directly: one per live egress."""
+        esids = [t.esid for t in self.db.tunnels(enabled_only=True)]
+        esids += [p.esid for p in self.db.pools(enabled_only=True)]
+        return [self.settings.dns.resolver_ip(e) for e in esids]
+
+    def _resolves_via(self, resolver: str) -> bool:
+        """Whether the test client gets an answer from this resolver."""
+        res = self._ns("dig", "+short", "+time=2", "+tries=1",
+                       f"@{resolver}", "example.com", timeout=8)
+        return res.ok and bool(res.stdout.strip())
+
     def _reaches_internet(self, timeout: int = 8) -> str | None:
         res = self._ns("curl", "--silent", "--fail", "--max-time", str(timeout),
                        "https://1.1.1.1/cdn-cgi/trace", timeout=timeout + 4)
@@ -292,6 +304,22 @@ class LeakTest:
                     f"blocked ({where or 'no counter moved'})"
                     if reachable is None
                     else f"LEAKED - reached the internet as {reachable}",
+                )
+                # DNS, from the same unassigned state. Such a client misses the
+                # DNAT that pins a client to its own resolver, so the input
+                # chain is all that stops it asking any egress's resolver by
+                # address - and choosing its exit country by the last octet.
+                # The probes above never asked a resolver, which is how that
+                # gap went unnoticed by this suite.
+                answered = [addr for addr in self._resolver_addresses()
+                            if self._resolves_via(addr)]
+                report.add(
+                    "unassigned_no_dns",
+                    "client with no egress cannot use any resolver",
+                    not answered,
+                    "no resolver answered"
+                    if not answered
+                    else "LEAKED - answered by " + ", ".join(answered),
                 )
                 client.egress_kind = egress_kind
                 client.egress_slug = egress_slug

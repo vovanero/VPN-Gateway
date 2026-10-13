@@ -1867,6 +1867,7 @@ const CHECK_TR = {
   exit_not_uplink: "The exit address is not the uplink's",
   no_leak_healthy: "Nothing reached the uplink while the tunnel was up",
   unassigned_blocked: "A client with no exit cannot reach the internet",
+  unassigned_no_dns: "A client with no exit cannot use any resolver",
   ipv6_blocked: "IPv6 cannot escape",
   dns_intercepted: "Hard-coded public DNS is intercepted",
   dns_is_ours: "The answering resolver is ours",

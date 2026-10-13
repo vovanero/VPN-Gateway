@@ -12,6 +12,7 @@ config, set the address, bring it up. Routes are the routing layer's job.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -52,6 +53,23 @@ PROBE_GRAIN = 1
 DEFAULT_KEEPALIVE = 25
 
 
+def _split_endpoint(endpoint: str) -> tuple[str, str]:
+    """``host:port`` -> (host, port), unwrapping a bracketed IPv6 literal."""
+    host, sep, port = (endpoint or "").rpartition(":")
+    return (host.strip("[]"), port) if sep else ((endpoint or ""), "")
+
+
+def _is_name(host: str) -> bool:
+    """True for a hostname, False for an address literal or nothing."""
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return False
+
+
 class WireGuardDriver(TunnelDriver):
     kind = TunnelKind.WIREGUARD
 
@@ -84,8 +102,9 @@ class WireGuardDriver(TunnelDriver):
             lines.append(f"PublicKey = {peer['public_key']}")
             if peer.get("preshared_key"):
                 lines.append(f"PresharedKey = {peer['preshared_key']}")
-            if peer.get("endpoint"):
-                lines.append(f"Endpoint = {peer['endpoint']}")
+            endpoint = self._endpoint_for(t, peer.get("endpoint", ""), spec)
+            if endpoint:
+                lines.append(f"Endpoint = {endpoint}")
             allowed = peer.get("allowed_ips") or ["0.0.0.0/0"]
             lines.append("AllowedIPs = " + ", ".join(allowed))
             # Always send one. A client tunnel with no keepalive cannot
@@ -123,6 +142,9 @@ class WireGuardDriver(TunnelDriver):
     def up(self, t: Tunnel) -> LinkInfo:
         spec = self._load(t)
         iface = t.iface
+        # Before the link exists, so a refusal leaves nothing behind and the
+        # reconciler simply tries again next pass.
+        self._check_chained_endpoints(t, spec)
 
         if not link_exists(iface):
             run(["ip", "link", "add", "dev", iface, "type", "wireguard"])
@@ -236,6 +258,53 @@ class WireGuardDriver(TunnelDriver):
             return f"{t.via} (not up)", 0
         wan = config.Settings.load().net.wan_iface
         return wan, ifaces.mtu_of(wan) if ifaces.exists(wan) else 0
+
+    # -- chained endpoints ----------------------------------------------------
+    #
+    # wg(8) resolves a hostname Endpoint itself, through the system resolver:
+    # the bootstrap DNS, over the uplink. For a chained tunnel that asks the
+    # ISP, in plaintext, for the exit provider's name every time the tunnel
+    # comes up - the second hop's identity, which is what a double VPN exists
+    # to hide. So a chained tunnel is handed the address vpngw resolved
+    # through its parent, and never a name.
+
+    @staticmethod
+    def _resolved_for_names(t: Tunnel, spec: dict) -> list[str]:
+        """Addresses in t.endpoints that came from names, not literal peers."""
+        literal = {_split_endpoint(p.get("endpoint", ""))[0]
+                   for p in spec.get("peers", [])
+                   if not _is_name(_split_endpoint(p.get("endpoint", ""))[0])}
+        return [e for e in t.endpoints if e not in literal]
+
+    def _check_chained_endpoints(self, t: Tunnel, spec: dict) -> None:
+        if not t.via:
+            return
+        named = [p for p in spec.get("peers", [])
+                 if _is_name(_split_endpoint(p.get("endpoint", ""))[0])]
+        if not named:
+            return
+        if len(named) > 1:
+            raise RuntimeError(
+                f"chained, and {len(named)} peers name their server by "
+                f"hostname; there is no telling which resolved address is "
+                f"whose, and wg would otherwise look them up over the uplink")
+        if not self._resolved_for_names(t, spec):
+            host = _split_endpoint(named[0]["endpoint"])[0]
+            raise RuntimeError(
+                f"chained, and {host} has not been resolved through {t.via} "
+                f"yet. Not bringing it up: wg would look the name up over "
+                f"the uplink. It comes up by itself once {t.via} can answer")
+
+    def _endpoint_for(self, t: Tunnel, endpoint: str, spec: dict) -> str:
+        if not endpoint or not t.via:
+            return endpoint
+        host, port = _split_endpoint(endpoint)
+        if not _is_name(host):
+            return endpoint
+        resolved = self._resolved_for_names(t, spec)
+        # _check_chained_endpoints has already refused the cases where this
+        # is empty; the guard keeps a name out of the config regardless.
+        return f"{resolved[0]}:{port}" if resolved and port else ""
 
     def down(self, t: Tunnel) -> None:
         # Deleting the link (rather than just downing it) makes the kernel

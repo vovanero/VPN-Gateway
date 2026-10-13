@@ -249,13 +249,21 @@ def ovpn_endpoint_hosts(spec: OvpnSpec) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_endpoints(hosts: list[str]) -> tuple[list[str], list[str]]:
+def resolve_endpoints(
+    hosts: list[str], *, via_resolver: str | None = None, offline: bool = False,
+) -> tuple[list[str], list[str]]:
     """Split hosts into literal addresses and names, resolving the names.
 
-    Returns ``(addresses, unresolved_hostnames)``. Names are kept so the
-    reconciler can re-resolve them later: providers rotate the address behind a
-    hostname, and a stale allowlist entry means the tunnel stops connecting
-    with no obvious cause.
+    Returns ``(addresses, hostnames)``. Names are kept so the reconciler can
+    re-resolve them later: providers rotate the address behind a hostname, and
+    a stale allowlist entry means the tunnel stops connecting with no obvious
+    cause.
+
+    ``via_resolver`` is for chained tunnels and must be given for them: names
+    are then asked of that egress's own resolver, whose upstream already
+    leaves through its tunnel, and never of the system resolver. ``offline``
+    resolves nothing - for a chained tunnel whose parent does not exist, where
+    there is no safe resolver to ask.
     """
     addrs: set[str] = set()
     names: list[str] = []
@@ -270,13 +278,56 @@ def resolve_endpoints(hosts: list[str]) -> tuple[list[str], list[str]]:
                 addrs.add(host)
             continue
 
+    if offline:
+        return sorted(addrs), names
     for name in names:
-        try:
-            infos = socket.getaddrinfo(name, None, family=socket.AF_INET)
-        except socket.gaierror as exc:
-            log.warning("cannot resolve endpoint %s: %s", name, exc)
-            continue
-        for info in infos:
-            addrs.add(info[4][0])
+        addrs.update(_resolve_via(name, via_resolver) if via_resolver
+                     else _resolve_system(name))
 
     return sorted(addrs), names
+
+
+def _resolve_system(name: str) -> list[str]:
+    """The system resolver: the bootstrap DNS, over the uplink.
+
+    Right for a tunnel that dials out over the uplink anyway - before any
+    tunnel exists there is nothing else to ask. Wrong for anything chained.
+    """
+    try:
+        infos = socket.getaddrinfo(name, None, family=socket.AF_INET)
+    except socket.gaierror as exc:
+        log.warning("cannot resolve endpoint %s: %s", name, exc)
+        return []
+    return [info[4][0] for info in infos]
+
+
+def _resolve_via(name: str, resolver: str) -> list[str]:
+    """Look a name up through one egress's own resolver, never the uplink.
+
+    A chained tunnel's server name is exactly what the uplink must not see.
+    Asking the bootstrap DNS for it tells the ISP, in plaintext, which exit
+    provider sits behind the first hop - and it did, at import and again
+    every fifteen minutes. The egress resolver's upstream already leaves
+    through its tunnel, so asking it keeps the name inside.
+
+    If that resolver cannot answer, the name stays unresolved. There is no
+    fallback to the system resolver: a chained tunnel that cannot be resolved
+    safely does not come up, which is the failure this gateway prefers.
+    """
+    from .net.shell import try_run
+
+    res = try_run(["dig", "+short", "+time=3", "+tries=2", "A", name,
+                   f"@{resolver}"], timeout=15)
+    if not res.ok:
+        log.warning("cannot resolve endpoint %s through %s", name, resolver)
+        return []
+    out = []
+    for token in res.stdout.split():
+        try:
+            if ipaddress.ip_address(token).version == 4:
+                out.append(token)
+        except ValueError:
+            continue  # CNAME targets and similar
+    if not out:
+        log.warning("%s has no address through %s", name, resolver)
+    return out

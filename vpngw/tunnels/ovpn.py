@@ -67,6 +67,10 @@ class OpenVpnDriver(TunnelDriver):
             auth_file=str(auth) if auth.exists() else None,
             mtu=t.mtu,
             fwmark=t.outer_mark if t.via else 0,
+            # Chained: never a hostname, which OpenVPN would resolve over the
+            # uplink. render raises if there is nothing safe to put there,
+            # and up() then fails before the unit starts.
+            remotes=list(t.endpoints) if t.via else None,
         )
         if removed:
             log.info("%s: neutralised %d provider directives (%s)", t.slug,

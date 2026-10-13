@@ -1,5 +1,56 @@
 # Changelog
 
+## 2.7.0 - three leaks closed before proxies arrive
+
+Found by a six-lens leak audit with independent verification, and by the
+design work for proxy egress. None of them put a client's real address on the
+internet. All of them leaked something the gateway promises to keep, and the
+first two went unnoticed because nothing tested for them.
+
+**A chained tunnel's server name was looked up over the uplink.** The exit
+provider's hostname went to the bootstrap DNS in plaintext - telling the ISP
+exactly which provider sits behind the first hop, which is the one fact a
+double VPN exists to hide. It leaked from three places, each now closed:
+
+- vpngw's own resolution, at import and every fifteen minutes. Chained names
+  are now asked of the parent egress's resolver, whose upstream already
+  leaves through the tunnel. If it cannot answer, the name stays unresolved:
+  there is no fallback to the uplink.
+- `wg setconf`. WireGuard resolves a hostname `Endpoint` itself, through the
+  system resolver, every time the tunnel comes up. A chained tunnel is now
+  handed the address resolved through its parent and never a name; with no
+  safe address it is not brought up at all, and comes up by itself once the
+  parent can answer.
+- OpenVPN, which does the same with `remote` lines. Named remotes on a
+  chained tunnel are pinned to the resolved addresses, literal remotes are
+  kept as they were, and with nothing safe left the tunnel does not start.
+
+**A chained tunnel's endpoint briefly sat on the WAN allow-list.** The full
+ruleset render and the incremental sync built `@vpn_endpoints` separately,
+and only the sync left chained tunnels out - so every structural rebuild put
+the exit provider's address on the list for one reconcile pass. Both now call
+one function.
+
+**An unregistered client could use any tunnel's DNS.** The DNAT that pins a
+client to its own resolver keys on the client map, and a source missing from
+it - never registered, disabled, or assigned to a tunnel that is off - simply
+missed it. The input chain then accepted its query to any address in the
+resolver range, so a machine the operator believed was fully blocked had a
+working, two-way DNS channel and could pick its exit country by changing the
+last octet. Resolver access now requires the client's fwmark, which exactly
+the registered, assigned clients carry. The `dns_hijacked` counter, which
+counted those misses as hijacks, now counts only real ones.
+
+The self-test gains the check that would have caught it - "a client with no
+exit cannot use any resolver" - which asks every live resolver directly from
+the unassigned test client. The probe it already ran never asked a resolver.
+
+**A row this version does not know no longer stops the daemon.** Rolling back
+past a release that adds a tunnel kind used to leave rows that made every
+`db.tunnels()` raise. Unknown kinds are now skipped, which is fail-closed:
+their interfaces are never built and their clients are dropped. Shipped ahead
+of proxy egress so that a later rollback is safe.
+
 ## 2.6.0 - the MTU is measured, and the exit address has a country
 
 **The gateway measures the path instead of trusting the interface.** 2.5.0

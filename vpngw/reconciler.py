@@ -220,15 +220,9 @@ class Reconciler:
         nft.sync_map("cli2mark", cli2mark)
         nft.sync_map("cli2dns", cli2dns)
         nft.sync_set("tun_ifaces", {f'"{t.iface}"' for t in enabled_tunnels})
-        # Only tunnels that legitimately dial out over the WAN. A chained
-        # tunnel's endpoint is deliberately absent: its handshake leaves
-        # through the parent (@tun_ifaces is already accepted), and keeping
-        # the address off this set means a routing mistake ends in a drop on
-        # the uplink, not in the ISP watching us greet the exit provider.
-        nft.sync_set(
-            "vpn_endpoints",
-            {ep for t in enabled_tunnels if not t.via for ep in t.endpoints},
-        )
+        # The same function the full render uses, so the two cannot disagree
+        # about which endpoints may be dialled over the WAN.
+        nft.sync_set("vpn_endpoints", render_nft.wan_endpoints(enabled_tunnels))
         nft.sync_set("provider_api", set(self._api_endpoints))
 
     # -- 2. routes ----------------------------------------------------------
@@ -617,10 +611,22 @@ class Reconciler:
         self.refresh_api_endpoints()
 
         changed = 0
+        by_slug = {t.slug: t for t in self.db.tunnels()}
         for t in self.db.tunnels(enabled_only=True):
             if not t.endpoint_hosts:
                 continue
-            addrs, _ = resolve_endpoints(t.endpoint_hosts)
+            if t.via:
+                # Through the parent's own resolver, never the bootstrap DNS:
+                # this name is the exit provider's, and asking for it over the
+                # uplink tells the ISP who sits behind the first hop.
+                parent = by_slug.get(t.via)
+                if parent is None:
+                    continue  # nothing safe to ask; keep the addresses we have
+                addrs, _ = resolve_endpoints(
+                    t.endpoint_hosts,
+                    via_resolver=self.settings.dns.resolver_ip(parent.esid))
+            else:
+                addrs, _ = resolve_endpoints(t.endpoint_hosts)
             literal = [e for e in t.endpoints if e not in addrs]
             merged = sorted(set(addrs) | set(literal))
             if merged != sorted(t.endpoints):

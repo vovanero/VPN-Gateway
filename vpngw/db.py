@@ -7,6 +7,7 @@ makes the kernel match; nothing else writes to the kernel.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -24,6 +25,8 @@ from .models import (
     ValidationError,
     normalise_slug,
 )
+
+log = logging.getLogger("vpngw.db")
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -152,12 +155,24 @@ class Database:
 
     # -- tunnels ------------------------------------------------------------
 
-    def _row_to_tunnel(self, r: sqlite3.Row) -> Tunnel:
+    def _row_to_tunnel(self, r: sqlite3.Row) -> Tunnel | None:
+        try:
+            kind = TunnelKind(r["kind"])
+        except ValueError:
+            # A kind written by a newer version. Raising here used to stop the
+            # daemon on every db.tunnels() - and a daemon that cannot start is
+            # a gateway with no firewall, which is a strange price for rolling
+            # back. Skipping the row is fail-closed: its interface is never
+            # built, so its clients have no egress and are dropped, and its
+            # esid stays reserved because _alloc_esid reads the table directly.
+            log.warning("tunnel %s has kind %r, which this version does not "
+                        "know; ignoring it", r["slug"], r["kind"])
+            return None
         return Tunnel(
             id=r["id"],
             slug=r["slug"],
             name=r["name"],
-            kind=TunnelKind(r["kind"]),
+            kind=kind,
             esid=r["esid"],
             enabled=bool(r["enabled"]),
             config_path=r["config_path"],
@@ -173,7 +188,8 @@ class Database:
         sql = "SELECT * FROM tunnel"
         if enabled_only:
             sql += " WHERE enabled = 1"
-        return [self._row_to_tunnel(r) for r in self._q(sql + " ORDER BY esid")]
+        rows = self._q(sql + " ORDER BY esid")
+        return [t for t in map(self._row_to_tunnel, rows) if t is not None]
 
     def tunnel(self, slug: str) -> Tunnel | None:
         # Slugs are stored folded, so lookups have to fold too - otherwise a

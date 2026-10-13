@@ -341,6 +341,32 @@ class TestNftRender(unittest.TestCase):
         text = self.render([Client(name="pc03", ip="10.10.0.13")])
         self.assertNotIn("10.10.0.13 :", text)
 
+    def test_only_marked_clients_reach_a_resolver(self):
+        """An unmarked source must not be able to pick a resolver by address.
+
+        It misses the DNAT that pins a client to its own resolver, so the input
+        accept is the only thing that could stop it asking 10.99.0.3 for tunnel
+        3's exit. Found by the leak audit: before this the accept matched on
+        interface and destination alone.
+        """
+        chain = self.render([])
+        chain = chain[chain.index("chain input {"):]
+        chain = chain[:chain.index("\n    }\n")]
+        dns = [l.strip() for l in chain.splitlines()
+               if "$RESOLVER_NET" in l and "dport 53" in l]
+        self.assertEqual(len(dns), 2, dns)
+        for line in dns:
+            self.assertIn("meta mark != 0x0", line)
+
+    def test_dns_hijack_counts_only_marked_clients(self):
+        text = self.render([])
+        nat = text[text.index("chain nat_prerouting {"):]
+        nat = nat[:nat.index("\n    }\n")]
+        # nft continues long rules with a trailing backslash; read them as one.
+        joined = " ".join(nat.replace(chr(92) + "\n", " ").split())
+        self.assertIn('meta mark != 0x0 udp dport 53 counter name "dns_hijacked"', joined)
+        self.assertIn("meta mark != 0x0 tcp dport 53", joined)
+
     def test_client_of_a_disabled_tunnel_gets_no_mapping(self):
         self.tunnels[0].enabled = False
         text = self.render([

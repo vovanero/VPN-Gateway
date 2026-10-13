@@ -249,7 +249,20 @@ def create_app(service) -> FastAPI:
             config.write_secret(config.SECRETS_DIR / f"{slug}.auth",
                                 f"{auth_user}\n{auth_pass}\n")
 
-        addrs, names = resolve_endpoints(hosts)
+        # A tunnel born chained must not have its server name looked up over
+        # the uplink: that tells the ISP which exit provider sits behind the
+        # first hop before the chain even exists. Ask the parent's resolver;
+        # with no parent there is nothing safe to ask, and validate_via below
+        # refuses the import anyway.
+        if via:
+            parent = db.tunnel(normalise_slug(via))
+            addrs, names = resolve_endpoints(
+                hosts,
+                via_resolver=(settings.dns.resolver_ip(parent.esid)
+                              if parent else None),
+                offline=parent is None)
+        else:
+            addrs, names = resolve_endpoints(hosts)
         # Born disabled when it is to be chained: the reconcile loop must
         # never find it enabled and unchained, because that is the pass in
         # which it would hand the new provider the WAN address.

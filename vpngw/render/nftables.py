@@ -56,6 +56,24 @@ def _elements(values) -> str:
     return f"        elements = {{ {body} }}\n"
 
 
+def wan_endpoints(tunnels) -> set[str]:
+    """Endpoints the gateway may dial over the uplink: unchained tunnels only.
+
+    A chained tunnel's endpoint is deliberately absent. Its handshake leaves
+    through the parent (@tun_ifaces is already accepted), and keeping the
+    address off this set means a routing mistake ends in a drop on the uplink,
+    not in the ISP watching us greet the exit provider - and not in the exit
+    provider seeing this gateway's real address, which is the one thing a
+    double VPN exists to prevent.
+
+    One function on purpose. The full render and the incremental sync used to
+    build this set separately, and only the sync remembered to leave riders
+    out: every structural rebuild then put a rider's endpoint on the WAN
+    allow-list for one pass, until the sync took it off again.
+    """
+    return {ep for t in tunnels if t.enabled and not t.via for ep in t.endpoints}
+
+
 def render(
     settings: Settings,
     tunnels: list[Tunnel],
@@ -100,7 +118,7 @@ def render(
         cli2mark.append(f"{c.ip} : {esid:#06x}")
         cli2dns.append(f"{c.ip} : {dns.resolver_ip(esid)}")
 
-    endpoints = sorted({ep for t in enabled_tunnels for ep in t.endpoints})
+    endpoints = sorted(wan_endpoints(enabled_tunnels))
     resolver_net = dns.resolver_subnet
 
     out: list[str] = [HEADER]
@@ -287,8 +305,17 @@ define RESOLVER_NET = {resolver_net}
 
         # Clients: DNS to their own hijacked resolver, and ping to the gateway
         # for diagnostics. Nothing else - not SSH, not the web UI.
-        iifname @client_ifaces ip daddr $RESOLVER_NET udp dport 53 accept
-        iifname @client_ifaces ip daddr $RESOLVER_NET tcp dport 53 accept
+        #
+        # The mark is what makes it "their own". Every client with a live
+        # egress carries a non-zero mark from cli2mark, and by the time it gets
+        # here the DNAT below has rewritten its query to its own resolver,
+        # whatever address it asked. A source with no mark - never registered,
+        # disabled, or assigned to an egress that is off - missed that DNAT.
+        # Without this test it could ask any egress's resolver by address and
+        # choose its own exit country by changing the last octet: a working,
+        # two-way DNS channel out of a machine the operator believes is blocked.
+        iifname @client_ifaces meta mark != 0x0 ip daddr $RESOLVER_NET udp dport 53 accept
+        iifname @client_ifaces meta mark != 0x0 ip daddr $RESOLVER_NET tcp dport 53 accept
         iifname @client_ifaces icmp type echo-request accept
 
         counter name "input_drop" drop
@@ -364,9 +391,14 @@ define RESOLVER_NET = {resolver_net}
         # A client cannot opt out of this.
 """)
     a("""\
-        iifname @client_ifaces udp dport 53 counter name "dns_hijacked" \\
+        # Marked sources only. An unmarked one is not in cli2dns either - the
+        # two maps are built by the same loop with the same skips - so the
+        # lookup would miss and do nothing; testing the mark first keeps the
+        # counter honest, where before it counted those misses as hijacks.
+        iifname @client_ifaces meta mark != 0x0 udp dport 53 \\
+            counter name "dns_hijacked" dnat ip to ip saddr map @cli2dns
+        iifname @client_ifaces meta mark != 0x0 tcp dport 53 \\
             dnat ip to ip saddr map @cli2dns
-        iifname @client_ifaces tcp dport 53 dnat ip to ip saddr map @cli2dns
     }
 
     chain nat_postrouting {
