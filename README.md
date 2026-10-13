@@ -95,6 +95,36 @@ A chained tunnel is still just a tunnel, so pools accept it as a member —
 `pool: [chain, single-hop]` is active/passive failover between double VPN
 and a plain fallback.
 
+## Proxy exits
+
+v2.8 adds SOCKS5 and HTTP proxies - residential proxies, typically - as exits,
+always chained behind one of your tunnels:
+
+```
+client → gateway → [entry: a WireGuard/OpenVPN tunnel] → [proxy] → internet
+                    ISP sees only this                    exit IP is this
+```
+
+There is no "direct" mode: dialled directly, the proxy's provider would see
+this gateway's real address. The relay (redsocks) runs in a network namespace
+of its own, so its traffic crosses the same kill switch as everything else - a
+proxy that is down blocks its clients, it never sends them around itself.
+Proxies carry TCP only: UDP from their clients (QUIC, video calls, games) is
+refused, and DNS is resolved at the far end, over TCP through the proxy.
+
+In the panel: **Tunnels → Add tunnel → Proxy**, paste the address your provider
+gives you and pick the tunnel to reach it through. It is tested through the
+chain before it is kept. Or:
+
+```bash
+vpngwctl tunnel add-proxy res-de1 socks5://user@gate.example.net:7000 --via nl01
+vpngwctl tunnel test res-de1
+```
+
+Pointed at a proxy, the self-test adds the checks only a proxy needs - that
+nothing goes around it. See [docs/operations.md](docs/operations.md#proxies)
+and [docs/killswitch.md](docs/killswitch.md#proxy-exits).
+
 ## What makes it different
 
 Plenty of routers can send different clients through different VPNs. The part
