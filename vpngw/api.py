@@ -12,12 +12,13 @@ run. None of them touches the kernel directly.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 from pathlib import Path
 
 from fastapi import (
-    Body, FastAPI, Header, HTTPException, Request, Response, UploadFile,
+    Body, FastAPI, Form, Header, HTTPException, Request, Response, UploadFile,
 )
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -110,12 +111,28 @@ def create_app(service) -> FastAPI:
 
     # -- UI ----------------------------------------------------------------
 
+    def _stamp_assets(html: str) -> str:
+        """Version the script and stylesheet URLs by their content.
+
+        The page is never cached, but app.js and app.css are served with
+        validators only, and browsers reuse such files on a heuristic for
+        hours. After an update that ran a new page against an old script -
+        and the two must agree on every dialog's markup, and on where a
+        login is sent.
+        """
+        for name in ("app.js", "app.css"):
+            asset = WEB / "static" / name
+            if asset.exists():
+                tag = hashlib.sha256(asset.read_bytes()).hexdigest()[:12]
+                html = html.replace(f'/static/{name}"', f'/static/{name}?v={tag}"')
+        return html
+
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         page = WEB / "templates" / "index.html"
         if not page.exists():
             return "<h1>VPN Gateway</h1><p>UI assets are missing.</p>"
-        return page.read_text(encoding="utf-8")
+        return _stamp_assets(page.read_text(encoding="utf-8"))
 
     # -- authentication ----------------------------------------------------
 
@@ -213,7 +230,10 @@ def create_app(service) -> FastAPI:
     @app.post("/api/tunnels/import")
     async def import_tunnel(
         slug: str, file: UploadFile, name: str = "", kind: str = "",
-        auth_user: str = "", auth_pass: str = "", via: str = "",
+        via: str = "",
+        # In the multipart body with the file, never the query string: a URL
+        # is what proxies, browser history and access logs keep.
+        auth_user: str = Form(""), auth_pass: str = Form(""),
         x_vpngw_token: str | None = Header(default=None),
     ) -> dict:
         authorise(x_vpngw_token)
@@ -315,7 +335,8 @@ def create_app(service) -> FastAPI:
                     raise HTTPException(
                         status_code=400,
                         detail=f"{t.slug} still carries {names} - unchain "
-                               f"them before disabling it")
+                               f"them, or move them to another entry, before "
+                               f"disabling it")
             t.enabled = wanted
         if "name" in body:
             t.name = str(body["name"])
@@ -328,13 +349,15 @@ def create_app(service) -> FastAPI:
                            "applies to that")
             t.mtu = int(body["mtu"])
         reapply = False
+        moved = False
         if "via" in body:
             via = str(body["via"] or "").strip()
             try:
                 db.validate_via(t.slug, via)
             except ValidationError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
-            reapply = reapply or via != t.via
+            moved = via != t.via
+            reapply = reapply or moved
             t.via = via
         proxy_fields = {"type", "host", "port"} & set(body)
         login_fields = {"username", "password"} & set(body)
@@ -347,9 +370,12 @@ def create_app(service) -> FastAPI:
                                           **{k: body[k] for k in proxy_fields}})
             except ValidationError as exc:
                 raise HTTPException(status_code=400, detail=str(exc))
-            if "host" in proxy_fields:
-                t.endpoints, t.endpoint_hosts = _resolve_proxy(t)
             reapply = True
+        if t.kind is TunnelKind.PROXY and ("host" in proxy_fields or moved):
+            # Looked up again through the entry it is now reached through:
+            # the old entry's resolver may be gone, and its answer was for
+            # where that tunnel exits, not this one.
+            t.endpoints, t.endpoint_hosts = _resolve_proxy(t)
         if login_fields:
             from .tunnels import proxy as proxy_mod
             current_user, current_password = proxy_mod.read_credentials(t.slug)
@@ -478,6 +504,10 @@ def create_app(service) -> FastAPI:
             d = driver.diagnose(t, fresh=True)
             return {"ok": False, "stage": d.get("stage"),
                     "message": driver.explain(t, d)}
+        # Measured again on the next pass, so the state shown beside this
+        # result follows it within seconds instead of a probe interval later.
+        service.reconciler.health.get(t.slug).last_sample = 0.0
+        service.request_reconcile()
         country = geo.country_of(exit_ip)
         return {"ok": True, "stage": "ok", "exit_ip": exit_ip,
                 "ms": round(ms) if ms else None,

@@ -127,10 +127,10 @@ class HealthMonitor:
         # DOWN is rate-limited too: a dead proxy's probe runs to its timeout,
         # and the loop that waits for it is the one every other tunnel's
         # failover runs in. Only a proxy still being measured for the first
-        # time is probed every pass, so a new one comes up promptly.
+        # time is probed every pass, so a new one comes up promptly - and so
+        # is one whose state is on its way to changing (see _settled).
         interval = getattr(driver, "probe_interval", 0)
-        if (interval and h.state in (HealthState.UP, HealthState.DOWN)
-                and now - h.last_sample < interval):
+        if interval and self._settled(h) and now - h.last_sample < interval:
             return h
         probe = getattr(driver, "probe", None)
         if probe is not None:
@@ -146,6 +146,18 @@ class HealthMonitor:
             h.exit_ip = exit_ip
             h.exit_ip_checked = now
         return self._settle(h, ok, "" if ok else (reason or "probe timed out"))
+
+    @staticmethod
+    def _settled(h) -> bool:
+        """UP with nothing failing since, or DOWN with nothing succeeding.
+
+        A state on its way to changing is measured every pass until it has
+        changed or not. Otherwise a proxy whose login was just fixed would
+        sit at "down" for rise_threshold rate-limited intervals - a minute
+        and more of the panel contradicting the test that just passed.
+        """
+        return ((h.state is HealthState.UP and not h.consecutive_fail)
+                or (h.state is HealthState.DOWN and not h.consecutive_ok))
 
     def refresh_exit_ip(self, t: Tunnel) -> None:
         h = self.get(t.slug)

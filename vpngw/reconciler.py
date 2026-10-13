@@ -369,6 +369,10 @@ class Reconciler:
                         # to its blackhole in between, never to the uplink.
                         driver.down(t)
                         self._link_info.pop(t.slug, None)
+                    # Measured on this pass rather than a probe interval
+                    # later: its login, address or entry just changed, and
+                    # whoever changed it is watching for the result.
+                    self.health.get(t.slug).last_sample = 0.0
                 if not ifaces.exists(t.iface):
                     try:
                         self._link_info[t.slug] = driver.up(t)

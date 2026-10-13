@@ -152,14 +152,18 @@
 <!-- ── modals ───────────────────────────────────────────────────────── -->
 <dialog id="dlgTunnel">
   <form method="dialog" id="formTunnel">
-    <h2>Import a tunnel</h2>
+    <h2>Add a tunnel</h2>
+    <div class="seg kind-seg">
+      <button type="button" class="on" aria-pressed="true">Config file</button>
+      <button type="button" data-switch="proxy" aria-pressed="false">Proxy</button>
+    </div>
     <p class="hint">A WireGuard <code>.conf</code> or OpenVPN <code>.ovpn</code>
       file. The type is detected. Your provider's routing and DNS directives are
       neutralised — on this machine those belong to the gateway.</p>
 
     <div class="field-row">
       <label class="field"><span>Short name <em>*</em></span>
-        <input name="slug" required maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9-]{0,9}"
+        <input name="slug" required maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9\-]{0,9}"
                placeholder="nl01" autocomplete="off">
         <small>Becomes the interface name. Ten characters at most.</small></label>
       <label class="field"><span>Display name</span>
@@ -201,6 +205,98 @@
   </form>
 </dialog>
 
+<dialog id="dlgProxy">
+  <form method="dialog" id="formProxy" autocomplete="off">
+    <h2>Add a tunnel</h2>
+    <div class="seg kind-seg">
+      <button type="button" data-switch="file" aria-pressed="false">Config file</button>
+      <button type="button" class="on" aria-pressed="true">Proxy</button>
+    </div>
+    <p class="hint">A SOCKS5 or HTTP proxy, reached through one of your VPN
+      tunnels. The proxy provider sees that tunnel's exit, never this
+      gateway's address.</p>
+
+    <div id="proxyBlocked"></div>
+
+    <label class="field"><span>Proxy address</span>
+      <input name="url" placeholder="socks5://user:password@gate.example.net:7000"
+             autocomplete="off" spellcheck="false">
+      <small id="proxyUrlNote"></small></label>
+
+    <div class="field-row three">
+      <div class="field"><span>Type</span>
+        <div class="seg" id="proxyType">
+          <button type="button" class="on" data-type="socks5" aria-pressed="true">SOCKS5</button>
+          <button type="button" data-type="http" aria-pressed="false">HTTP</button>
+        </div></div>
+      <label class="field"><span>Server <em>*</em></span>
+        <input name="host" required placeholder="gate.example.net"
+               autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Port <em>*</em></span>
+        <input name="port" required inputmode="numeric" maxlength="5"
+               pattern="[0-9]{1,5}" placeholder="1080" autocomplete="off"></label>
+    </div>
+
+    <div class="field-row">
+      <label class="field"><span>Username</span>
+        <input name="username" autocomplete="off" spellcheck="false"></label>
+      <label class="field"><span>Password</span>
+        <input name="password" type="password" autocomplete="new-password"></label>
+    </div>
+
+    <div class="field-row">
+      <label class="field"><span>Short name <em>*</em></span>
+        <input name="slug" required maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9\-]{0,9}"
+               placeholder="res-de1" autocomplete="off">
+        <small id="proxySlugNote"></small></label>
+      <label class="field"><span>Display name</span>
+        <input name="name" placeholder="Residential Germany" autocomplete="off"></label>
+    </div>
+
+    <label class="field"><span>Route through <em>*</em></span>
+      <select name="via" required></select>
+      <small>Required. The fastest tunnel that is up is picked for you. There
+        is no option to dial the proxy directly.</small></label>
+
+    <div class="chain-preview" id="proxyPreview"></div>
+
+    <div class="notice">
+      <svg class="ic" viewBox="0 0 24 24"><use href="#i-activity"/></svg>
+      <div><b>TCP only.</b> Websites, downloads and most apps work. Video
+        calls, online games, VoIP and anything else that needs UDP will not
+        work on this exit. Those packets are refused, never sent around the
+        proxy.</div>
+    </div>
+
+    <details class="disclosure">
+      <summary id="proxySeesTitle">What the entry tunnel's provider can see</summary>
+      <p class="hint" style="margin-bottom:0">The proxy login and which
+        addresses you connect to, but not page content: HTTPS stays encrypted.
+        Prefer a proxy that asks for a username and password. One that admits
+        callers by address would also admit that provider's other customers,
+        who leave from the same address.</p>
+    </details>
+
+    <div id="proxyResult"></div>
+
+    <footer>
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok" id="proxyAdd">Add proxy</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlgProxyEdit">
+  <form method="dialog" id="formProxyEdit" autocomplete="off">
+    <h2 id="proxyEditTitle"></h2>
+    <div id="proxyEditBody"></div>
+    <footer>
+      <button class="btn" value="cancel" formnovalidate>Cancel</button>
+      <button class="btn primary" value="ok">Save</button>
+    </footer>
+  </form>
+</dialog>
+
 <dialog id="dlgClient">
   <form method="dialog" id="formClient">
     <h2 id="clientDlgTitle">Add a client</h2>
@@ -215,6 +311,10 @@
     <label class="field"><span>Exit</span>
       <select name="egress" id="clientEgress"></select>
       <small>Pick a pool and it will fail over between its members automatically.</small></label>
+    <div class="notice hidden" id="clientProxyNotice">
+      <svg class="ic" viewBox="0 0 24 24"><use href="#i-activity"/></svg>
+      <div></div>
+    </div>
     <label class="field"><span>Note</span>
       <input name="notes" placeholder="optional" autocomplete="off"></label>
     <footer>
@@ -244,7 +344,7 @@
       falling back to the uplink.</p>
     <div class="field-row">
       <label class="field"><span>Short name <em>*</em></span>
-        <input name="slug" required maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9-]{0,9}"
+        <input name="slug" required maxlength="10" pattern="[A-Za-z0-9][A-Za-z0-9\-]{0,9}"
                placeholder="eu" autocomplete="off"></label>
       <label class="field"><span>Display name</span>
         <input name="name" placeholder="Europe" autocomplete="off"></label>

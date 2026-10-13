@@ -860,6 +860,13 @@ class SelftestPicksALiveTunnel(unittest.TestCase):
                   {"slug": "b", "state": "up", "routed": True}]
         self.assertEqual(self._pick(["a", "b"], status), "tunnel:b")
 
+    def test_a_proxy_is_not_the_default_target(self):
+        """It carries TCP only, and the suite is written for an exit that
+        carries everything: through a proxy, a sound gateway would fail."""
+        status = [{"slug": "res-de1", "kind": "proxy", "state": "up", "routed": True},
+                  {"slug": "vpn1", "kind": "wireguard", "state": "up", "routed": True}]
+        self.assertEqual(self._pick(["res-de1", "vpn1"], status), "tunnel:vpn1")
+
     def test_no_live_tunnel_refuses_rather_than_reporting_a_leak(self):
         status = [{"slug": "a", "state": "down", "routed": False}]
         with self.assertRaises(SystemExit) as caught:
@@ -882,6 +889,7 @@ class SelftestPicksALiveTunnel(unittest.TestCase):
         self.assertNotIn("enabled[0].slug", body,
                          "the panel still tests through a tunnel by position")
         self.assertIn('t.state === "up" && t.routed', body)
+        self.assertIn("!isProxy(t)", body, "the panel would test through a proxy")
 
 
 class StylesheetTokensExist(unittest.TestCase):

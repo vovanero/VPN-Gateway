@@ -556,6 +556,35 @@ class TheHealthProbe(unittest.TestCase):
         self.mon.refresh_exit_ip(self.t)
         self.assertEqual(called, [])
 
+    def test_a_state_on_its_way_to_changing_is_measured_every_pass(self):
+        """A proxy whose login was just fixed must not sit at "down" for
+        rise_threshold slow intervals after its first good probe."""
+        from vpngw.models import HealthState
+        self.reply = (False, None, None, "The proxy rejected the username or password.")
+        for _ in range(self.mon.s.fail_threshold):
+            h = self.mon.probe(self.t)
+        self.assertIs(h.state, HealthState.DOWN)
+        before = len(self.calls)
+        for _ in range(3):
+            self.mon.probe(self.t)
+        self.assertEqual(len(self.calls), before, "a settled DOWN is rate-limited")
+        # The login is fixed; rebuilding the relay clears last_sample.
+        self.reply = (True, 480.0, "198.51.100.77", "")
+        h.last_sample = 0.0
+        for _ in range(self.mon.s.rise_threshold):
+            h = self.mon.probe(self.t)
+        self.assertIs(h.state, HealthState.UP)
+        self.assertEqual(len(self.calls), before + self.mon.s.rise_threshold)
+
+    def test_a_failure_while_up_is_followed_up_at_once(self):
+        from vpngw.models import HealthState
+        for _ in range(self.mon.s.rise_threshold):
+            h = self.mon.probe(self.t)
+        self.reply = (False, None, None, "The proxy relay stopped.")
+        h.last_sample = 0.0                      # its interval has passed
+        for _ in range(self.mon.s.fail_threshold):
+            h = self.mon.probe(self.t)
+        self.assertIs(h.state, HealthState.DOWN)
 
 class TheReconciler(unittest.TestCase):
 
@@ -794,6 +823,212 @@ class TheNamespaceIsMadeWhereEveryoneCanSeeIt(unittest.TestCase):
         self.assertTrue(all(c[:len(self.proxy.HOST_MOUNTS)] == self.proxy.HOST_MOUNTS
                             for c in self.calls))
 
+
+class TheLoginProblems(unittest.TestCase):
+    """"Wrong password" and "wants a password" and "takes no password" are
+    three different fixes, so they are three different messages."""
+
+    def serve(self, reply):
+        import socketserver
+        import threading
+
+        class H(socketserver.BaseRequestHandler):
+            def handle(self):
+                self.request.recv(4096)
+                self.request.sendall(reply)
+        srv = socketserver.TCPServer(("127.0.0.1", 0), H)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1]
+
+    def check(self, kind, port, username):
+        from vpngw import proxycheck
+        return proxycheck.check({"type": kind, "server": "127.0.0.1", "port": port,
+                                 "username": username,
+                                 "password": "p1-secret" if username else ""})
+
+    def test_socks5_refusing_every_offered_method(self):
+        refuse = bytes([5, 0xFF])
+        self.assertEqual(self.check("socks5", self.serve(refuse), "")["detail"],
+                         "needs a login")
+        self.assertEqual(self.check("socks5", self.serve(refuse), "u1")["detail"],
+                         "refuses a username and password")
+
+    def test_http_407(self):
+        reply = b"HTTP/1.1 407 Proxy Authentication Required" + bytes([13, 10, 13, 10])
+        self.assertEqual(self.check("http", self.serve(reply), "")["detail"], "needs a login")
+        self.assertEqual(self.check("http", self.serve(reply), "u1")["detail"], "login rejected")
+
+    def test_each_says_its_own_fix(self):
+        from vpngw.tunnels.proxy import ProxyDriver
+        t = px("res-de1", 7)
+        say = lambda detail: ProxyDriver().explain(t, {"stage": "auth", "detail": detail})
+        self.assertIn("none is set", say("needs a login"))
+        self.assertIn("admit callers by address", say("refuses a username and password"))
+        self.assertEqual(say("login rejected"), "The proxy rejected the username or password.")
+
+
+class TheStatusRow(unittest.TestCase):
+
+    def test_it_names_the_failed_step_and_never_the_password(self):
+        import json
+        import time
+        from vpngw import service
+        from vpngw.tunnels import proxy
+        self.addCleanup(setattr, proxy, "read_credentials", proxy.read_credentials)
+        proxy.read_credentials = lambda slug: ("u1", "p1-secret")
+        self.addCleanup(proxy._diagnoses.pop, "res-de1", None)
+        proxy._diagnoses["res-de1"] = (time.time(), {"stage": "auth", "ok": False})
+        row = service._proxy_row(px("res-de1", 7))
+        self.assertEqual(row["proxy_stage"], "auth")
+        self.assertTrue(row["has_password"])
+        self.assertNotIn("p1-secret", json.dumps(row))
+
+
+class AfterAChange(unittest.TestCase):
+    """A relay rebuilt with a new login, address or entry is measured at once,
+    so the state shown beside a passed test agrees with it."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def src(self, rel):
+        return (self.ROOT / rel).read_text(encoding="utf-8")
+
+    def test_a_rebuilt_relay_is_measured_on_the_same_pass(self):
+        src = self.src("vpngw/reconciler.py")
+        body = src[src.index("if t.slug in self._reapply:"):]
+        body = body[:body.index("if not ifaces.exists(t.iface):")]
+        self.assertIn("last_sample = 0.0", body)
+
+    def test_a_passed_test_is_followed_by_a_measurement(self):
+        api = self.src("vpngw/api.py")
+        body = api[api.index("def test_tunnel("):api.index("def delete_tunnel(")]
+        self.assertLess(body.index("last_sample = 0.0"), body.index('"stage": "ok"'))
+        self.assertIn("service.request_reconcile()", body)
+
+    def test_a_new_entry_means_a_new_lookup(self):
+        """The old entry's answer was for where that tunnel exits."""
+        api = self.src("vpngw/api.py")
+        body = api[api.index("def patch_tunnel("):api.index("def _resolve_proxy(")]
+        self.assertIn('("host" in proxy_fields or moved)', body)
+
+class ThePanel(unittest.TestCase):
+    """The panel's half of proxy egress. Where a check needs JavaScript to
+    run, node runs it, and the check is skipped on a machine without one."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def js(self):
+        return (self.ROOT / "vpngw/web/static/app.js").read_text(encoding="utf-8")
+
+    def html(self):
+        return (self.ROOT / "vpngw/web/templates/index.html").read_text(encoding="utf-8")
+
+    def fn(self, name):
+        src = self.js()
+        start = src.index(f"function {name}(")
+        return src[start:src.index("\n}\n", start) + 2]
+
+    def node(self, script):
+        import subprocess
+        res = subprocess.run(["node", "-e", script], capture_output=True,
+                             text=True, encoding="utf-8")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not installed")
+    def test_it_parses(self):
+        """A syntax error anywhere blanks the whole panel, with no message
+        anywhere an operator would look."""
+        import subprocess
+        res = subprocess.run(["node", "--check", str(self.ROOT / "vpngw/web/static/app.js")],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 0, res.stderr)
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not installed")
+    def test_a_pasted_address_becomes_fields_and_loses_its_password(self):
+        import json
+        src = self.js()
+        start = src.index("const proxyUrlOf =")
+        url_of = src[start:src.index(";\n", start) + 2]
+        cases = ["socks5://user:pass@gate.example.net:7000",
+                 "gate.example.net:7000:user:pa:ss",
+                 "http://u%40x:p%3Aw@198.51.100.9:8080",
+                 "user:pass@gate.example.net:1080",
+                 "gate.example.net:1080",
+                 "https://u:p@h.example:443",
+                 "socks4://h.example:1080",
+                 "gate.example.net",
+                 "gate.example.net:99999"]
+        got = json.loads(self.node(
+            self.fn("parseProxyUrl") + url_of
+            + "console.log(JSON.stringify(" + json.dumps(cases) + ".map((c) => {"
+            + " const r = parseProxyUrl(c);"
+            + " return [r, r && !r.error ? proxyUrlOf({ ...r, type: r.type || 'socks5' }) : null];"
+            + " })));"))
+        first, shown = got[0]
+        self.assertEqual([first[k] for k in ("type", "host", "port", "username", "password")],
+                         ["socks5", "gate.example.net", 7000, "user", "pass"])
+        self.assertEqual(shown, "socks5://user@gate.example.net:7000")
+        self.assertEqual([got[1][0][k] for k in ("type", "host", "port", "username", "password")],
+                         [None, "gate.example.net", 7000, "user", "pa:ss"])
+        self.assertEqual((got[2][0]["username"], got[2][0]["password"]), ("u@x", "p:w"))
+        self.assertEqual((got[3][0]["username"], got[3][0]["password"]), ("user", "pass"))
+        self.assertEqual((got[4][0]["host"], got[4][0]["username"]), ("gate.example.net", ""))
+        self.assertIn("not supported", got[5][0]["error"])
+        self.assertIn("socks5://", got[6][0]["error"])
+        self.assertEqual((got[7][0], got[8][0]), (None, None))
+        for parsed, shown in got:
+            if parsed and not parsed.get("error") and parsed["password"]:
+                self.assertNotIn(parsed["password"], shown)
+
+    @unittest.skipUnless(__import__("shutil").which("node"), "node is not installed")
+    def test_every_field_pattern_compiles_as_the_browser_compiles_it(self):
+        """Chrome compiles pattern="" with the v flag. There a bare "-" in a
+        character class is a syntax error, the pattern is dropped without a
+        word, and the field validates nothing."""
+        import json
+        import re
+        patterns = re.findall(r'pattern="([^"]+)"', self.html())
+        self.assertGreaterEqual(len(patterns), 3)
+        self.node("for (const p of " + json.dumps(patterns) + ")"
+                  " new RegExp('^(?:' + p + ')$', 'v'); console.log('ok')")
+
+    def test_no_login_goes_into_a_url(self):
+        """A query string ends up in history and in logs; a login never
+        belongs in one."""
+        import re
+        js = self.js()
+        for block in re.findall(r"new URLSearchParams[(][{](.*?)[}][)]", js, re.S):
+            self.assertNotRegex(block, r"(?i)pass|auth", block)
+        start = js.index('$("#formTunnel").addEventListener("submit"')
+        handler = js[start:js.index("\n});\n", start)]
+        self.assertIn('body.append("auth_pass"', handler)
+
+    def test_the_import_reads_the_login_from_the_body(self):
+        api = (self.ROOT / "vpngw/api.py").read_text(encoding="utf-8")
+        start = api.index("async def import_tunnel(")
+        sig = api[start:api.index(") -> dict:", start)]
+        self.assertIn('auth_user: str = Form("")', sig)
+        self.assertIn('auth_pass: str = Form("")', sig)
+
+    def test_a_proxy_that_fails_its_test_is_not_kept(self):
+        body = self.fn("addProxy")
+        tested = body.index("await testProxy(")
+        removed = body.index('"DELETE"')
+        shown = body.index("say({ ok: false, message: v.message + tail })")
+        self.assertLess(tested, removed)
+        self.assertLess(removed, shown)
+
+    def test_a_proxy_is_offered_only_where_it_can_go(self):
+        self.assertIn("filter((t) => !isProxy(t))", self.fn("openPoolDialog"))
+        self.assertIn("!t.via && !isProxy(t)", self.fn("openTunnelDialog"))
+        self.assertIn("const tunnels = s.tunnels.filter((t) => !isProxy(t));",
+                      self.fn("openChainDialog"))
+        self.assertIn('label: "Proxies"', self.fn("egressOptions"))
+        # ...and never with a way to dial it directly.
+        self.assertNotIn('value: ""', self.fn("entryOption"))
 
 if __name__ == "__main__":
     unittest.main()

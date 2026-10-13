@@ -72,6 +72,16 @@ PROBE_TIMEOUT = 5
 DIAGNOSIS_TTL = 60
 _diagnoses: dict[str, tuple[float, dict]] = {}
 
+
+def last_stage(slug: str) -> str:
+    """The step the last diagnosis of a proxy found broken, or "".
+
+    For the panel, so it can offer the fix that matches - a new login, a new
+    address - without running a test of its own to find out which.
+    """
+    cached = _diagnoses.get(slug)
+    return str(cached[1].get("stage") or "") if cached else ""
+
 #: Characters redsocks can carry inside a quoted config string. Its format has
 #: no escaping, so a quote, backslash, semicolon or line break could end the
 #: string early and start a directive of the caller's choosing. Refusing them
@@ -380,7 +390,13 @@ class ProxyDriver(TunnelDriver):
         return {
             "resolve": f"{t.proxy.get('host')} couldn't be resolved through {t.via}.",
             "connect": f"The proxy at {where} didn't answer through {t.via}.",
-            "auth": "The proxy rejected the username or password.",
+            "auth": {
+                "needs a login": "The proxy wants a username and password, "
+                                 "and none is set.",
+                "refuses a username and password":
+                    "The proxy does not take a username and password: it may "
+                    "admit callers by address instead.",
+            }.get(d.get("detail"), "The proxy rejected the username or password."),
             "tunnel": "The proxy accepted the login but would not connect "
                       f"onward: {d.get('detail') or 'no reason given'}.",
             "ok": "The proxy answers, but the relay did not carry the probe.",

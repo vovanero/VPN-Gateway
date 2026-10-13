@@ -21,6 +21,9 @@ const S = {
   filters: { clients: "", logs: "", logLevel: "all", tunnels: "" },
   selection: new Set(),
   drawerSlug: null,
+  // The last proxy test per slug, for its drawer. Kept here for the same
+  // reason as the self-test report below: the poll re-renders the drawer.
+  proxyTests: {},
   lastError: null,
   // Held in state rather than written straight into the DOM: the poll loop
   // re-renders the whole page every few seconds and would otherwise wipe the
@@ -402,7 +405,9 @@ function renderDashboard(host) {
         ? "No client packet has ever reached the uplink. Without a tunnel, no client reaches the internet at all."
         : `${ks.leaked_packets.toLocaleString()} forwarded packet(s) tried to leave via the uplink and were blocked. That is not a leak — it is the record of the kill switch doing its job.`),
       ks.maintenance && el("p", {},
-        `The gateway's own egress is open for another ${Math.ceil(ks.maintenance_remaining / 60)} minute(s). Client traffic is unaffected.`)),
+        `The gateway's own egress is open for another ${Math.ceil(ks.maintenance_remaining / 60)} minute(s). Client traffic is unaffected.`),
+      ks.proxy_udp_refused > 0 && el("p", {},
+        `${ks.proxy_udp_refused.toLocaleString()} UDP packet(s) from clients on proxy exits were refused: those exits carry TCP only.`)),
     el("div", { class: "hero-actions" },
       ks.maintenance
         ? el("button", { class: "btn", onclick: () => setMaintenance(null) },
@@ -725,7 +730,7 @@ function tunnelCard(t) {
     el("div", { class: "card-head" },
       el("div", { style: "min-width:0" },
         el("h3", {}, t.name),
-        el("p", { class: "mono" }, `${t.kind} · ${t.iface}`)),
+        el("p", { class: "mono" }, kindLine(t))),
       pill(state)),
     el("div", { class: "card-body", style: "padding:12px 16px" },
       sparkline(hist, state === "up" ? COLOR.tx : "var(--text-3)"),
@@ -798,7 +803,8 @@ function chainsSection(s, query = "") {
   if (!chained.length) return null;
 
   return el("div", { style: "margin-bottom:18px" },
-    el("div", { class: "section-title" }, `Double VPN · ${chained.length}`),
+    el("div", { class: "section-title" },
+      `${chained.some(isProxy) ? "Chains" : "Double VPN"} · ${chained.length}`),
     ...chained.map((exit) => {
       const entry = bySlug[exit.via];
       return el("div", { class: "card chain-card" },
@@ -810,19 +816,26 @@ function chainsSection(s, query = "") {
           chainArrow(),
           chainHop(entry, "entry"),
           chainArrow(),
-          chainHop(exit, "exit"),
+          chainHop(exit, isProxy(exit) ? `proxy · ${exit.proxy?.type || "?"}` : "exit"),
           chainArrow(),
           el("div", { class: "chain-end" },
             el("div", { class: "chain-end-label" }, "internet sees"),
             el("div", { class: "mono", style: "font-size:12px" },
-              exit.exit_ip || "—"))),
+              exit.exit_ip || "—"),
+            exitCountry(exit))),
         el("div", { class: "row", style: "padding:0 16px 12px;gap:14px" },
           el("span", { class: "sub" },
             `end to end ${exit.rtt_ms ? Math.round(exit.rtt_ms) + " ms" : "—"}`
-            + ` · mtu ${exit.mtu || "auto"}`),
+            + (isProxy(exit) ? "" : ` · mtu ${exit.mtu || "auto"}`)),
+          isProxy(exit) ? tcpTag() : null,
           el("span", { class: "spacer" }),
-          el("button", { class: "btn sm", onclick: () => unchain(exit.slug) },
-            "Unchain")));
+          // A proxy cannot leave its chain - dialled directly, its provider
+          // would see this gateway's address - it can only change entry.
+          isProxy(exit)
+            ? el("button", { class: "btn sm",
+                onclick: () => openProxyEdit(exit, "entry") }, "Change entry")
+            : el("button", { class: "btn sm", onclick: () => unchain(exit.slug) },
+                "Unchain")));
     }));
 }
 
@@ -853,7 +866,10 @@ function unchain(slug) {
 
 function openChainDialog() {
   const s = S.snap;
-  if (s.tunnels.length < 2) {
+  // Proxies take no part here: one is chained from its own dialog, and none
+  // can carry a tunnel. They still count below as riders of their entries.
+  const tunnels = s.tunnels.filter((t) => !isProxy(t));
+  if (tunnels.length < 2) {
     toast("warn", "A double VPN needs two tunnels",
           "One carries the other. Import a second tunnel first.");
     return;
@@ -877,7 +893,7 @@ function openChainDialog() {
   // difference between picking and hunting, and the browser's own
   // type-ahead works on whatever is sorted sensibly.
   const pick = (name, blockedFn) => {
-    const ordered = [...s.tunnels].sort((a, b) =>
+    const ordered = [...tunnels].sort((a, b) =>
       (!!blockedFn(a) - !!blockedFn(b)) || a.name.localeCompare(b.name));
     return el("select", { name, class: "grow" },
       ...ordered.map((t) => {
@@ -889,8 +905,8 @@ function openChainDialog() {
   const entrySel = pick("entry", entryBlocked);
   const exitSel = pick("exit", exitBlocked);
 
-  const freeEntries = s.tunnels.filter((t) => !entryBlocked(t));
-  const freeExits = s.tunnels.filter((t) => !exitBlocked(t));
+  const freeEntries = tunnels.filter((t) => !entryBlocked(t));
+  const freeExits = tunnels.filter((t) => !exitBlocked(t));
   const buildable = freeEntries.length && freeExits.length &&
     !(freeEntries.length === 1 && freeExits.length === 1 &&
       freeEntries[0].slug === freeExits[0].slug);
@@ -906,10 +922,14 @@ function openChainDialog() {
     $("#chainCreate").classList.add("hidden");
     host.replaceChildren(
       el("p", { class: "sub", style: "line-height:1.55;margin-bottom:14px" },
-        "Both tunnels are already linked as a double VPN. To build a "
-        + "different one, dissolve this chain first — or import another "
-        + "tunnel so a second chain has hops of its own."),
-      ...s.tunnels.filter((t) => t.via).map((exit) => {
+        tunnels.some((t) => t.via)
+          ? "Both tunnels are already linked as a double VPN. To build a "
+            + "different one, dissolve this chain first — or import another "
+            + "tunnel so a second chain has hops of its own."
+          : "Every tunnel already carries a proxy, and a tunnel that carries "
+            + "something cannot also ride through another: the ceiling is "
+            + "two hops. Import another tunnel to build a double VPN."),
+      ...tunnels.filter((t) => t.via).map((exit) => {
         const entry = bySlug[exit.via];
         return el("div", { style: "border:1px solid var(--border);"
                                 + "border-radius:var(--r);padding:12px 14px;"
@@ -1034,8 +1054,8 @@ function tunnelRow(t) {
   return el("tr", {},
     el("td", { class: "name" },
       el("button", { class: "linkish", onclick: () => openDrawer(t.slug) }, t.name),
-      el("div", { class: "sub mono" }, `${t.kind} · ${t.iface}`
-        + (t.via ? ` · via ${t.via}` : ""))),
+      el("div", { class: "sub mono" }, kindLine(t)),
+      isProxy(t) ? el("div", { style: "margin-top:4px" }, tcpTag()) : null),
     el("td", { class: "tight" }, pill(state),
       t.enabled && t.state === "down" && t.last_error
         ? el("div", { class: "sub wrap" }, t.last_error) : null),
@@ -1055,6 +1075,237 @@ function tunnelRow(t) {
       el("button", { class: "btn sm danger", title: "Delete",
         onclick: () => removeTunnel(t) }, icon("trash")))));
 }
+
+/* ── proxy egress ──────────────────────────────────────────────────────────
+ *
+ * A SOCKS5 or HTTP proxy is an exit like a tunnel is, always chained behind
+ * one: dialled directly, its provider would see this gateway's real address,
+ * so nothing below offers that. It is drawn wherever a tunnel is, and one
+ * fact goes wherever its name does - it carries TCP only.
+ */
+
+const isProxy = (t) => !!t && t.kind === "proxy";
+const PROXY_TYPES = { socks5: "SOCKS5", http: "HTTP" };
+const KIND_NAMES = { wireguard: "WireGuard", openvpn: "OpenVPN" };
+
+/** A failed proxy's diagnosis in a few words, for the label on its hop. */
+const PROXY_STAGE_SHORT = {
+  resolve: "name not found", connect: "no answer", auth: "login rejected",
+  tunnel: "refused onward", ok: "relay not carrying", relay: "relay stopped",
+};
+
+/** The line under a tunnel's name: what it is, its interface, its entry. */
+function kindLine(t) {
+  return (isProxy(t) ? `proxy · ${t.proxy?.type || "?"}` : t.kind)
+    + ` · ${t.iface}` + (t.via ? ` · via ${t.via}` : "");
+}
+
+function tcpTag() {
+  return el("span", { class: "tag-tcp",
+    title: "UDP from its clients is refused, never sent around the proxy" },
+    "TCP only");
+}
+
+/** Whether an exit value such as "tunnel:res-de1" names a proxy. */
+function egressIsProxy(value) {
+  const [kind, slug] = String(value || "").split(":");
+  return kind === "tunnel" &&
+    isProxy((S.snap?.tunnels || []).find((t) => t.slug === slug));
+}
+
+const tcpOnlyToast = () => toast("warn", "TCP only on this exit",
+  "Video calls, games and other UDP traffic from it are refused. "
+  + "Browsing and downloads work.");
+
+/** Tunnels a proxy can be reached through - switched on, not chained
+ *  themselves, not proxies: the rule validate_via enforces - up and fastest
+ *  first. One that is down is listed but cannot be picked: a proxy behind it
+ *  could not be tested, and an untested proxy is not kept. */
+function proxyEntries(except) {
+  const rank = { up: 0, unknown: 1, down: 2 };
+  return (S.snap?.tunnels || [])
+    .filter((t) => t.enabled && !t.via && !isProxy(t) && t.slug !== except)
+    .sort((a, b) => ((rank[a.state] ?? 1) - (rank[b.state] ?? 1))
+      || ((a.rtt_ms ?? 1e9) - (b.rtt_ms ?? 1e9))
+      || a.name.localeCompare(b.name));
+}
+
+function entryOption(t) {
+  const state = { up: "up", down: "down" }[t.state] || "measuring";
+  return el("option", { value: t.slug, disabled: t.state === "down" },
+    (t.name && t.name !== t.slug ? `${t.slug} — ${t.name}` : t.slug)
+    + ` · ${state}`
+    + (t.state === "up" && t.rtt_ms ? ` · ${Math.round(t.rtt_ms)} ms` : ""));
+}
+
+/** Red, because something is blocked right now - and the fix beside it. */
+function blockedNotice(title, body, action) {
+  return el("div", { class: "notice blocked", role: "alert" },
+    icon("alert"),
+    el("div", {}, el("b", {}, title), " ", body),
+    action ? el("div", { class: "actions" }, action) : null);
+}
+
+/** The path a proxy's traffic takes, top to bottom. Only the first broken
+ *  hop is red; the ones behind it wait in grey - a chain painted red from
+ *  end to end says nothing about which link broke. `hop` describes the
+ *  proxy, which may not exist yet. */
+function proxyPath(head, entry, hop, tail) {
+  const kindName = (t) => KIND_NAMES[t.kind] || t.kind;
+  const entryOff = !entry || !entry.enabled || entry.state === "down";
+  const entryNote = !entry ? "" : !entry.enabled ? "switched off"
+    : entry.state === "down" ? "down"
+    : entry.rtt_ms ? `${Math.round(entry.rtt_ms)} ms` : "measuring";
+  const entryHop = entry
+    ? el("div", { class: "chain-vhop " + (entry.enabled ? entry.state : "waiting") },
+        el("div", { class: "row" },
+          pill(entry.enabled ? entry.state : "disabled"),
+          el("b", {}, entry.slug),
+          el("span", { class: "mode-tag" }, kindName(entry)),
+          el("span", { class: "spacer" }),
+          el("span", { class: "sub" }, `entry · ${entryNote}`)),
+        el("div", { class: "sees-line" }, `ISP sees ${kindName(entry)} to `,
+          el("span", { class: "mono" },
+            entry.endpoints[0] || entry.endpoint_hosts[0] || "?")))
+    : el("div", { class: "chain-vhop down" },
+        el("div", { class: "row" }, pill("down", "missing"),
+          el("b", {}, hop.via || "no entry")));
+  const dim = entryOff || hop.state === "waiting" || hop.state === "disabled";
+  const proxyHop = el("div", { class: "chain-vhop " + (dim ? "waiting" : hop.state) },
+    el("div", { class: "row" },
+      hop.state === "disabled" ? pill("disabled")
+        : dim ? pill("disabled", "waiting") : pill(hop.state),
+      el("b", {}, hop.name),
+      el("span", { class: "mode-tag" }, hop.type),
+      tcpTag(),
+      el("span", { class: "spacer" }),
+      el("span", { class: "sub" },
+        entryOff && entry && hop.state !== "disabled" ? `needs ${entry.slug}` : hop.note)),
+    el("div", { class: "sees-line" },
+      `Sees ${entry ? entry.slug + "'s" : "its entry's"} exit address, never this gateway's`));
+  const arrow = () => el("div", { class: "chain-varrow", "aria-hidden": "true" }, "↓");
+  return el("div", { class: "chain-vert" },
+    el("div", { class: "chain-vend" }, head), arrow(),
+    entryHop, arrow(), proxyHop, arrow(),
+    el("div", { class: "chain-vend" }, tail));
+}
+
+function testResult(kind, ...kids) {
+  return el("div", { class: "test-result " + kind, role: "status" },
+    icon({ ok: "check", fail: "alert" }[kind] || "clock"),
+    el("span", {}, ...kids));
+}
+
+/** A test's verdict as one line: where it exits, or which link broke. */
+function verdictView(v) {
+  if (v.busy) return testResult("busy", v.note || "Testing…");
+  if (!v.ok) return testResult("fail", v.message);
+  return testResult("ok", v.message, " · exits as ",
+    el("span", { class: "mono" }, v.exit_ip || "?"),
+    v.country
+      ? ` · ${v.country_code ? flagOf(v.country_code) + " " : ""}${v.country}` : "",
+    v.ms ? ` · ${v.ms} ms` : "");
+}
+
+const verdictText = (v) => `${v.message} · exits as ${v.exit_ip || "?"}`
+  + (v.country ? ` · ${v.country}` : "") + (v.ms ? ` · ${v.ms} ms` : "");
+
+const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** One verdict on a proxy, from the daemon. A relay that is still starting
+ *  is not a verdict, so that is waited out, within a limit. A first failure
+ *  to connect is tried once more: a cold first connection through two hops
+ *  can miss the probe's timeout with nothing wrong. */
+async function testProxy(slug, progress) {
+  const deadline = Date.now() + 30000;
+  let retried = false;
+  for (;;) {
+    let v;
+    try {
+      v = await api(`/api/tunnels/${slug}/test`, "POST", {});
+    } catch (err) {
+      return { ok: false, stage: "error", message: err.message };
+    }
+    if (v.ok) return v;
+    const starting = v.stage === "relay" && Date.now() < deadline;
+    const again = !starting && !retried && (v.stage === "connect" || v.stage === "ok");
+    if (!starting && !again) return v;
+    if (again) retried = true;
+    if (progress) progress(starting ? "Waiting for the relay to start…"
+                                    : "No answer yet, trying once more…");
+    await pause(starting ? 1500 : 2000);
+  }
+}
+
+/** "Test now" in the drawer. The verdict is kept in state because the poll
+ *  re-renders the drawer every few seconds. `delay` lets a just-changed
+ *  relay restart before it is judged. */
+async function runProxyTest(t, delay = 0) {
+  const show = (v) => { S.proxyTests[t.slug] = v; renderDrawer(); };
+  show({ busy: true, note: delay ? "Applying the change, then testing…"
+                                 : `Testing through ${t.via}…` });
+  if (delay) await pause(delay);
+  const v = await testProxy(t.slug, (note) => show({ busy: true, note }));
+  show(v);
+  if (S.drawerSlug !== t.slug)
+    toast(v.ok ? "ok" : "err",
+      v.ok ? `'${t.slug}' works` : `'${t.slug}' failed its test`,
+      v.ok ? verdictText(v) : v.message);
+  await refresh();
+}
+
+/** What a provider hands out, as fields. Takes scheme://user:pass@host:port,
+ *  user:pass@host:port, host:port:user:pass and host:port - the shapes proxy
+ *  providers actually print. null for anything else; { error } for a shape
+ *  that is understood but not supported. */
+function parseProxyUrl(text) {
+  let rest = String(text || "").trim();
+  if (!rest) return null;
+  let type = null;
+  const sep = rest.indexOf("://");
+  if (sep !== -1) {
+    const scheme = rest.slice(0, sep).toLowerCase();
+    rest = rest.slice(sep + 3);
+    if (scheme === "https")
+      return { error: "https:// proxies - TLS to the proxy itself - are not "
+        + "supported yet. If your provider also offers http://, use that: "
+        + "what you reach through it is still HTTPS end to end." };
+    type = { socks5: "socks5", socks5h: "socks5", socks: "socks5",
+             http: "http" }[scheme];
+    if (!type)
+      return { error: `${scheme}:// is not a kind of proxy this gateway speaks. `
+        + "Use socks5:// or http://." };
+  }
+  rest = rest.replace(/[/]+$/, "");
+  let user = "", pass = "", hostport = rest;
+  const at = rest.lastIndexOf("@");
+  if (at !== -1) {
+    const cred = rest.slice(0, at);
+    hostport = rest.slice(at + 1);
+    const c = cred.indexOf(":");
+    user = c === -1 ? cred : cred.slice(0, c);
+    pass = c === -1 ? "" : cred.slice(c + 1);
+  } else if (!type) {
+    const parts = rest.split(":");
+    if (parts.length >= 3) {
+      hostport = parts[0] + ":" + parts[1];
+      user = parts[2];
+      pass = parts.slice(3).join(":");
+    }
+  }
+  const colon = hostport.lastIndexOf(":");
+  if (colon <= 0) return null;
+  const host = hostport.slice(0, colon);
+  const portText = hostport.slice(colon + 1);
+  const port = Number(portText);
+  if (!/^[0-9]{1,5}$/.test(portText) || port < 1 || port > 65535) return null;
+  const dec = (x) => { try { return decodeURIComponent(x); } catch (_) { return x; } };
+  return { type, host, port, username: dec(user), password: dec(pass) };
+}
+
+/** The address as shown back in the field: never with a password in it. */
+const proxyUrlOf = ({ type, host, port, username }) =>
+  `${type}://${username ? encodeURIComponent(username) + "@" : ""}${host}:${port}`;
 
 /* ── page: pools ───────────────────────────────────────────────────────── */
 
@@ -1276,12 +1527,25 @@ function clientRow(c) {
 function egressOptions(selected) {
   const out = [el("option", { value: "", selected: selected === "" },
     "— no exit (blocked) —")];
-  if (S.snap.tunnels.length) {
+  const vpns = S.snap.tunnels.filter((t) => !isProxy(t));
+  const proxies = S.snap.tunnels.filter(isProxy);
+  if (vpns.length) {
     const g = el("optgroup", { label: "Tunnels" });
-    for (const t of S.snap.tunnels)
+    for (const t of vpns)
       g.append(el("option", { value: "tunnel:" + t.slug,
         selected: selected === "tunnel:" + t.slug },
         `${t.name}${t.via ? " — double VPN via " + t.via : ""}`
+        + `${t.enabled ? "" : " (disabled)"}`));
+    out.push(g);
+  }
+  // A group of their own, so nobody picks one thinking it is a VPN: each
+  // says what it cannot carry.
+  if (proxies.length) {
+    const g = el("optgroup", { label: "Proxies" });
+    for (const t of proxies)
+      g.append(el("option", { value: "tunnel:" + t.slug,
+        selected: selected === "tunnel:" + t.slug },
+        `${t.name} — via ${t.via} · TCP only`
         + `${t.enabled ? "" : " (disabled)"}`));
     out.push(g);
   }
@@ -1762,6 +2026,11 @@ function renderSecurity(host) {
     ["dns_hijacked", "DNS queries intercepted", "Redirected to the resolver for that client's own tunnel, whatever address the client was configured with.", "ok"],
     ["host_egress_drop", "The gateway's own blocked traffic", "Strict host egress. If a tunnel will not connect, look here — its endpoint address may not be on the allow-list.", "warn"],
   ];
+  if (s.tunnels.some(isProxy) || c.proxy_nontcp_drop?.packets
+      || c.proxy_upstream_drop?.packets)
+    counterRows.push(
+      ["proxy_nontcp_drop", "Client UDP refused on a proxy exit", "Proxy exits carry TCP only. UDP from their clients is refused with an ICMP error, so apps fall back to TCP at once; none of it is sent around the proxy.", "ok"],
+      ["proxy_upstream_drop", "A proxy relay reaching past its server", "A proxy's relay may reach one address and port, its server, through its entry tunnel. Anything else it sends stops here: above zero means something in a proxy's namespace tried to go elsewhere.", "danger"]);
 
   add(host, [
     el("div", { class: "card", style: "margin-bottom:20px" },
@@ -1890,7 +2159,10 @@ async function runSelftest(disrupt) {
   // had never handshaken, and a gateway with nothing wrong reported "critical
   // failures" - the kill switch correctly blackholing a dead tunnel, read as
   // the worst result the suite has.
-  const target = enabled.find((t) => t.state === "up" && t.routed);
+  //
+  // Not through a proxy: it carries TCP only, and these checks are written
+  // for an exit that carries everything.
+  const target = enabled.find((t) => !isProxy(t) && t.state === "up" && t.routed);
   if (!target) {
     toast("err", "No tunnel is up",
       "There is nothing to send test traffic through. That is not a leak — " +
@@ -1964,6 +2236,7 @@ function searchBox(key, placeholder) {
 
 function openDrawer(slug) { S.drawerSlug = slug; renderDrawer(); }
 function closeDrawer() {
+  delete S.proxyTests[S.drawerSlug];
   S.drawerSlug = null;
   $("#drawer").classList.add("hidden");
   $("#drawerBackdrop").classList.add("hidden");
@@ -2015,11 +2288,11 @@ function renderDrawer() {
   $("#drawerBackdrop").classList.remove("hidden");
   $("#drawerTitle").textContent = t.name;
   $("#drawerSub").textContent = `${t.iface} · table ${t.table} · mark ${t.mark}`
-    + (t.via ? ` · double VPN via ${t.via}` : "");
+    + (isProxy(t) ? ` · proxy via ${t.via}` : t.via ? ` · double VPN via ${t.via}` : "");
 
-  const rttSeries = t.history.map((h) => h.rtt || 0);
   const body = $("#drawerBody");
   body.replaceChildren();
+  if (isProxy(t)) { add(body, proxyDrawer(t)); return; }
   add(body, [
     el("div", { class: "row", style: "margin-bottom:16px" },
       pill(t.enabled ? t.state : "disabled"),
@@ -2035,19 +2308,7 @@ function renderDrawer() {
       style: "font-size:12.5px;color:var(--warn);background:var(--warn-soft);padding:10px 12px;border-radius:6px;margin-bottom:16px;line-height:1.5" },
       "This tunnel's routing table has no real default route left, only its blackhole. Clients assigned to it have no internet — which is the intended behaviour, not a fault.") : null,
 
-    el("div", { class: "section-title" }, "Latency"),
-    el("div", { class: "card" }, el("div", { class: "card-body" },
-      chart([{ values: rttSeries, color: COLOR.rtt }],
-            { height: 130, unit: (v) => Math.round(v) + "ms" }))),
-
-    el("div", { class: "section-title" }, "Traffic"),
-    el("div", { class: "card" }, el("div", { class: "card-body" },
-      chart([{ values: t.history.map((h) => h.rx), color: COLOR.rx },
-             { values: t.history.map((h) => h.tx), color: COLOR.tx }],
-            { height: 130, unit: (v) => bytes(v) + "/s" }),
-      el("div", { class: "legend" },
-        el("span", {}, el("i", { style: `background:${COLOR.rx}` }), "download " + rate(t.rx_rate)),
-        el("span", {}, el("i", { style: `background:${COLOR.tx}` }), "upload " + rate(t.tx_rate))))),
+    drawerCharts(t),
 
     el("div", { class: "section-title" }, "Details"),
     el("div", { class: "card" }, el("div", { class: "card-body" },
@@ -2079,6 +2340,127 @@ function renderDrawer() {
   ]);
 }
 
+/* ── drawer: a proxy ───────────────────────────────────────────────────── */
+
+/** What is wrong comes first, with the one button that fixes it; then the
+ *  path, hop by hop; then the numbers. */
+function proxyDrawer(t) {
+  const s = S.snap;
+  const entry = s.tunnels.find((x) => x.slug === t.via);
+  const entryOff = !entry || !entry.enabled || entry.state === "down";
+  const users = (s.clients || []).filter(
+    (c) => c.egress_kind === "tunnel" && c.egress_slug === t.slug);
+  const test = S.proxyTests[t.slug];
+  const testBtn = (label, cls) => el("button", { class: "btn sm" + (cls || ""),
+    disabled: !t.enabled || !!test?.busy, onclick: () => runProxyTest(t) },
+    icon("play"), label);
+
+  let banner = null;
+  if (t.enabled && entryOff) {
+    banner = blockedNotice(
+      !entry ? `${t.via} is missing, so ${t.slug} can't reach its proxy.`
+      : !entry.enabled ? `${t.via} is switched off, so ${t.slug} can't reach its proxy.`
+      : `${t.via} is down, so ${t.slug} can't reach its proxy.`,
+      `Clients on ${t.slug} are blocked until ${t.via} is back.`,
+      entry ? el("button", { class: "btn sm",
+        onclick: () => openDrawer(entry.slug) }, `Open ${entry.slug}`) : null);
+  } else if (t.enabled && t.state === "down") {
+    const fix = { auth: ["Change login", "key", "login"],
+                  resolve: ["Change address", "edit", "address"] }[t.proxy_stage];
+    banner = blockedNotice(t.last_error || "The proxy is not answering.",
+      `Clients on ${t.slug} have no internet until this is fixed. Nothing `
+      + "is sent around the proxy.",
+      [fix ? el("button", { class: "btn sm primary",
+               onclick: () => openProxyEdit(t, fix[2]) }, icon(fix[1]), fix[0])
+           : null,
+       testBtn("Test again")]);
+  }
+
+  const internet = t.state === "up" && t.exit_ip
+    ? ["Internet sees ", el("span", { class: "mono" }, t.exit_ip),
+       t.exit_country ? el("span", { class: "as-is" }, ` · ${t.exit_country}`) : ""]
+    : t.enabled && !entryOff && t.state === "unknown" ? "Internet · measuring"
+    : "Internet · nothing reaches it";
+  const path = proxyPath(
+    `${users.length} client${users.length === 1 ? "" : "s"}`, entry,
+    { name: t.slug, type: PROXY_TYPES[t.proxy?.type] || "proxy", via: t.via,
+      state: t.enabled ? t.state : "disabled",
+      note: !t.enabled ? "switched off"
+        : t.state === "down" ? PROXY_STAGE_SHORT[t.proxy_stage] || "down"
+        : t.rtt_ms ? `proxy · ${Math.round(t.rtt_ms)} ms` : "proxy · measuring" },
+    internet);
+
+  const kv = (term, ...value) => [el("dt", {}, term), el("dd", {}, ...value)];
+  const details = el("dl", { class: "kv" },
+    kv("Type", `${PROXY_TYPES[t.proxy?.type] || "?"}`
+      + `${t.proxy?.type === "http" ? " CONNECT" : ""}, `
+      + (t.username ? "username and password" : "no login")),
+    kv("Server", `${t.proxy?.host}:${t.proxy?.port}`,
+      el("div", { class: "sub", style: t.endpoints.length ? "" : "color:var(--danger)" },
+        t.endpoints.length ? `${t.endpoints.join(", ")} · looked up through ${t.via}`
+                           : `not resolved through ${t.via} yet`),
+      el("button", { class: "linkish", style: "font-size:12px",
+        onclick: () => openProxyEdit(t, "address") }, "Change address")),
+    kv("Username", t.username || "—"),
+    kv("Password", t.has_password ? "set · never shown" : "none"),
+    kv("Route through", entry && entry.name !== entry.slug
+      ? `${t.via} — ${entry.name}` : t.via),
+    kv("Exit address", t.exit_ip || "—", exitCountry(t)),
+    kv("End to end", t.rtt_ms ? `${Math.round(t.rtt_ms)} ms, measured over HTTPS` : "—"),
+    kv("UDP", "refused: this exit carries TCP only"),
+    kv("DNS", "resolved at the proxy's end, over TCP"),
+    kv("Clients", users.map((c) => c.name || c.ip).join(", ") || "—"),
+    kv("Interface", t.iface),
+    kv("Up for", t.up_since ? ago(t.up_since) : "—"),
+    t.last_error && !banner ? kv("Last error",
+      el("span", { style: "color:var(--danger)" }, t.last_error)) : null);
+
+  return [
+    banner,
+    el("div", { class: "row wrap", style: "gap:8px;margin-bottom:16px" },
+      pill(t.enabled ? t.state : "disabled"),
+      el("span", { class: "spacer" }),
+      testBtn("Test now"),
+      el("button", { class: "btn sm", onclick: () => openProxyEdit(t, "login") },
+        icon("key"), "Change login"),
+      el("button", { class: "btn sm", onclick: () => openProxyEdit(t, "entry") },
+        icon("link"), "Change entry"),
+      el("button", { class: "btn sm", onclick: () => renameTunnel(t) }, "Rename"),
+      el("button", { class: "btn sm", onclick: () => toggleTunnel(t) },
+        icon("power"), t.enabled ? "Disable" : "Enable")),
+    test ? verdictView(test) : null,
+    el("div", { class: "section-title" }, "Path"),
+    el("div", { class: "chain-preview" }, path),
+    drawerCharts(t),
+    el("div", { class: "section-title" }, "Details"),
+    el("div", { class: "card" }, el("div", { class: "card-body" }, details)),
+    el("div", { class: "row", style: "margin-top:22px" },
+      el("span", { class: "spacer" }),
+      el("button", { class: "btn danger", onclick: () => removeTunnel(t) },
+        icon("trash"), "Delete proxy")),
+  ];
+}
+
+/** Latency and traffic: the same two charts for every kind of exit. */
+function drawerCharts(t) {
+  return [
+    el("div", { class: "section-title" }, "Latency"),
+    el("div", { class: "card" }, el("div", { class: "card-body" },
+      chart([{ values: t.history.map((h) => h.rtt || 0), color: COLOR.rtt }],
+            { height: 130, unit: (v) => Math.round(v) + "ms" }))),
+    el("div", { class: "section-title" }, "Traffic"),
+    el("div", { class: "card" }, el("div", { class: "card-body" },
+      chart([{ values: t.history.map((h) => h.rx), color: COLOR.rx },
+             { values: t.history.map((h) => h.tx), color: COLOR.tx }],
+            { height: 130, unit: (v) => bytes(v) + "/s" }),
+      el("div", { class: "legend" },
+        el("span", {}, el("i", { style: `background:${COLOR.rx}` }),
+          "download " + rate(t.rx_rate)),
+        el("span", {}, el("i", { style: `background:${COLOR.tx}` }),
+          "upload " + rate(t.tx_rate))))),
+  ];
+}
+
 /* ── actions ───────────────────────────────────────────────────────────── */
 
 const toggleTunnel = (t) =>
@@ -2100,8 +2482,11 @@ async function removeTunnel(t) {
   if (riders.length) {
     await confirmDialog(`'${t.name}' cannot be deleted yet`,
       `It is the entry hop for ${riders.map((r) => r.name).join(", ")}. `
-      + "Dissolve that double VPN first - the Unchain button on the chain "
-      + "card - then delete this tunnel.", "Got it");
+      + (riders.some(isProxy)
+          ? "Move each to another entry or remove it first - Change entry or "
+            + "Unchain, on its chain card - then delete this tunnel."
+          : "Dissolve that double VPN first - the Unchain button on the chain "
+            + "card - then delete this tunnel."), "Got it");
     return;
   }
   if (pools.length) {
@@ -2131,8 +2516,9 @@ async function removeTunnel(t) {
       }
     }
   } else {
-    const ok = await confirmDialog(`Delete '${t.name}'?`,
-      "Its config file and keys are deleted too. This cannot be undone.");
+    const ok = await confirmDialog(`Delete '${t.name}'?`, isProxy(t)
+      ? "Its stored login is deleted too. This cannot be undone."
+      : "Its config file and keys are deleted too. This cannot be undone.");
     if (!ok) return;
   }
 
@@ -2151,9 +2537,11 @@ async function removePool(p) {
   if (ok) await mutate(() => api("/api/pools/" + p.slug, "DELETE"), "Pool deleted");
 }
 
-const assignClient = (ip, egress) =>
-  mutate(() => api("/api/clients/" + ip, "PATCH", { egress: egress || "none" }),
+async function assignClient(ip, egress) {
+  await mutate(() => api("/api/clients/" + ip, "PATCH", { egress: egress || "none" }),
     egress ? "Exit updated" : "Client blocked (no exit assigned)");
+  if (egressIsProxy(egress)) tcpOnlyToast();
+}
 
 async function bulkAssign(egress) {
   if (!egress && egress !== "") return;
@@ -2163,6 +2551,7 @@ async function bulkAssign(egress) {
       await api("/api/clients/" + ip, "PATCH", { egress: egress || "none" });
   }, `Updated the exit for ${ips.length} client(s)`);
   S.selection.clear();
+  if (egressIsProxy(egress)) tcpOnlyToast();
 }
 
 async function removeClient(c) {
@@ -2183,7 +2572,7 @@ function openTunnelDialog() {
   // through another cannot carry a third.
   const sel = $("#importVia");
   if (sel) {
-    const usable = (S.snap?.tunnels || []).filter((t) => !t.via);
+    const usable = (S.snap?.tunnels || []).filter((t) => !t.via && !isProxy(t));
     sel.replaceChildren(
       el("option", { value: "" },
         "Nothing — this tunnel dials out over the uplink"),
@@ -2207,10 +2596,13 @@ $("#formTunnel").addEventListener("submit", async (ev) => {
 
   const params = new URLSearchParams({
     slug: f.slug.value.toLowerCase(), name: f.name.value,
-    auth_user: f.auth_user.value, auth_pass: f.auth_pass.value,
     via: f.via ? f.via.value : "" });
   const body = new FormData();
   body.append("file", file);
+  // The OpenVPN login travels in the body, with the file. In the URL it
+  // would sit in browser history and in any log on the way.
+  body.append("auth_user", f.auth_user.value);
+  body.append("auth_pass", f.auth_pass.value);
 
   try {
     const res = await fetch("/api/tunnels/import?" + params, { method: "POST", body });
@@ -2247,6 +2639,302 @@ $("#formTunnel").addEventListener("submit", async (ev) => {
     if (ev.dataTransfer.files.length) { input.files = ev.dataTransfer.files; setLabel(); }
   });
 }
+
+/* ── dialog: add a proxy ───────────────────────────────────────────────── */
+
+const PROXY_URL_HINT = "Paste what your provider gives you. A password in "
+  + "the address is moved to the Password field and never shown again.";
+let proxyKind = "socks5";
+let proxyFailure = null;      // the stage the last attempt failed at
+
+function setProxyKind(kind) {
+  proxyKind = kind === "http" ? "http" : "socks5";
+  for (const b of document.querySelectorAll("#proxyType button")) {
+    const on = b.dataset.type === proxyKind;
+    b.classList.toggle("on", on);
+    b.setAttribute("aria-pressed", String(on));
+  }
+  $("#formProxy").port.placeholder = proxyKind === "http" ? "8080" : "1080";
+}
+
+function proxyUrlNote(text, tone) {
+  const note = $("#proxyUrlNote");
+  note.textContent = text;
+  note.className = tone ? "note-" + tone : "";
+}
+
+/** Pasting the provider's address fills the fields - and takes the password
+ *  out of the address at once: that field is plain text, and the masked
+ *  field is the only place a password belongs. */
+function onProxyUrl() {
+  const f = $("#formProxy");
+  const got = parseProxyUrl(f.url.value);
+  proxyUrlNote(PROXY_URL_HINT);
+  if (!got) return;
+  if (got.error) { proxyUrlNote(got.error, "bad"); return; }
+  if (got.type) setProxyKind(got.type);
+  f.host.value = got.host;
+  f.port.value = String(got.port);
+  if (got.username) f.username.value = got.username;
+  if (got.password) {
+    f.password.value = got.password;
+    f.url.value = proxyUrlOf({ ...got, type: proxyKind });
+    proxyUrlNote("The password was moved to the Password field.", "ok");
+  }
+  drawProxyPreview();
+}
+
+/** Edits to the fields show up in the address, so the two never disagree. */
+function syncProxyUrl() {
+  const f = $("#formProxy");
+  const host = f.host.value.trim(), port = f.port.value.trim();
+  if (!host || !port) return;
+  f.url.value = proxyUrlOf({ type: proxyKind, host, port,
+                             username: f.username.value.trim() });
+  proxyUrlNote(PROXY_URL_HINT);
+}
+
+function drawProxyPreview() {
+  const f = $("#formProxy");
+  if (!S.snap || !$("#dlgProxy").open) return;
+  const entry = S.snap.tunnels.find((t) => t.slug === f.via.value);
+  const slug = f.slug.value.trim().toLowerCase();
+  $("#proxySlugNote").replaceChildren("Becomes the interface ",
+    el("code", {}, "px-" + (slug || "…")), ".");
+  $("#proxySeesTitle").textContent =
+    `What ${entry ? entry.slug + "'s" : "the entry tunnel's"} provider can see`;
+  $("#proxyPreview").replaceChildren(proxyPath("Your clients", entry,
+    { name: slug || "new proxy", type: PROXY_TYPES[proxyKind],
+      state: proxyFailure ? "down" : "waiting", via: f.via.value,
+      note: proxyFailure ? PROXY_STAGE_SHORT[proxyFailure] || "failed" : "proxy" },
+    "Internet sees the proxy's address"));
+}
+
+function openProxyDialog() {
+  const f = $("#formProxy");
+  f.reset();
+  setProxyKind("socks5");
+  proxyFailure = null;
+  proxyUrlNote(PROXY_URL_HINT);
+  $("#proxyResult").replaceChildren();
+
+  const entries = proxyEntries();
+  const usable = entries.filter((t) => t.state !== "down");
+  f.via.replaceChildren(...entries.map(entryOption));
+  if (usable.length) f.via.value = usable[0].slug;
+
+  // No tunnel to reach it through: say so, and say why there is no
+  // "directly" to fall back on, rather than offer a form that cannot work.
+  const vpns = (S.snap?.tunnels || []).filter((t) => !isProxy(t));
+  $("#proxyBlocked").replaceChildren(...(usable.length ? [] : [blockedNotice(
+    vpns.length ? "No tunnel can carry a proxy right now."
+                : "A proxy is reached through one of your tunnels, and there is none yet.",
+    vpns.length ? "It needs a tunnel that is up, switched on, and not itself "
+                  + "the second hop of a double VPN."
+                : "Import a WireGuard or OpenVPN tunnel first. Dialled directly, "
+                  + "the proxy's provider would see this gateway's real address.",
+    vpns.length ? null : el("button", { class: "btn sm", type: "button",
+      onclick: () => { $("#dlgProxy").close(); openTunnelDialog(); } },
+      "Import a tunnel"))]));
+  $("#proxyAdd").disabled = !usable.length;
+
+  $("#dlgProxy").showModal();
+  drawProxyPreview();
+}
+
+/** Add, test through the chain, and keep it only if it works. A proxy that
+ *  fails is deleted again - nothing switched on is left behind - and the
+ *  form stays as it was, with the reason, to be corrected. */
+async function addProxy(req) {
+  const dlg = $("#dlgProxy");
+  const say = (v) => { if (dlg.open) $("#proxyResult").replaceChildren(verdictView(v)); };
+  say({ busy: true, note: `Adding ${req.slug}…` });
+  let res;
+  try {
+    res = await api("/api/tunnels/proxy", "POST", req);
+  } catch (err) {
+    say({ ok: false, message: err.message });
+    if (!dlg.open) toast("err", "Could not add the proxy", err.message);
+    return;
+  }
+  say({ busy: true, note: `Starting the relay and testing through ${res.via}…` });
+  refresh();
+  const v = await testProxy(res.slug, (note) => say({ busy: true, note }));
+  if (v.ok) {
+    if (dlg.open) dlg.close();
+    toast("ok", `Added '${res.slug}'`, verdictText(v));
+    S.proxyTests[res.slug] = v;
+    await refresh();
+    return;
+  }
+  let tail = " Nothing was kept: correct the form and add it again.";
+  try {
+    await api("/api/tunnels/" + res.slug, "DELETE");
+  } catch (_) {
+    tail = ` It could not be removed, so it was switched off: delete ${res.slug} from its drawer.`;
+    try { await api("/api/tunnels/" + res.slug, "PATCH", { enabled: false }); } catch (_) {}
+  }
+  say({ ok: false, message: v.message + tail });
+  proxyFailure = v.stage === "entry" ? null : v.stage || "relay";
+  drawProxyPreview();
+  if (!dlg.open) toast("err", `'${res.slug}' did not work`, v.message + tail);
+  await refresh();
+}
+
+$("#formProxy").addEventListener("submit", async (ev) => {
+  if (ev.submitter?.value === "cancel") return;
+  ev.preventDefault();          // the dialog stays open until it works
+  const f = ev.target;
+  const req = {
+    slug: f.slug.value.trim().toLowerCase(), name: f.name.value.trim(),
+    via: f.via.value, type: proxyKind, host: f.host.value.trim(),
+    port: Number(f.port.value), username: f.username.value.trim(),
+    password: f.password.value };
+  const fail = (message) =>
+    $("#proxyResult").replaceChildren(verdictView({ ok: false, message }));
+  if (!req.via) return fail("Pick the tunnel the proxy is reached through.");
+  if (!!req.username !== !!req.password)
+    return fail("Fill in both the username and the password, or neither.");
+  const btn = $("#proxyAdd");
+  btn.disabled = true;
+  try { await addProxy(req); } finally { btn.disabled = false; }
+});
+
+{
+  const f = $("#formProxy");
+  f.url.addEventListener("input", onProxyUrl);
+  for (const name of ["host", "port", "username"])
+    f[name].addEventListener("input", syncProxyUrl);
+  f.slug.addEventListener("input", drawProxyPreview);
+  f.via.addEventListener("change", drawProxyPreview);
+  for (const b of document.querySelectorAll("#proxyType button"))
+    b.addEventListener("click", () => {
+      setProxyKind(b.dataset.type);
+      syncProxyUrl();
+      drawProxyPreview();
+    });
+  // A password typed here leaves the page with the dialog.
+  $("#dlgProxy").addEventListener("close", () => {
+    if ($("#dlgProxy").open) return;
+    f.reset();
+    proxyFailure = null;
+    $("#proxyResult").replaceChildren();
+  });
+  $("#dlgTunnel").addEventListener("close", () => {
+    if (!$("#dlgTunnel").open) $("#formTunnel").reset();
+  });
+  // Any edit makes the last failure history: the preview stops showing it.
+  f.addEventListener("input", () => {
+    if (proxyFailure) { proxyFailure = null; drawProxyPreview(); }
+  });
+  // "Config file" and "Proxy" at the top of both dialogs: one dialog to the
+  // eye, two forms underneath, so neither can disturb the other's fields.
+  for (const b of document.querySelectorAll("[data-switch]"))
+    b.addEventListener("click", () => {
+      if (b.dataset.switch === "proxy") { $("#dlgTunnel").close(); openProxyDialog(); }
+      else { $("#dlgProxy").close(); openTunnelDialog(); }
+    });
+}
+
+/* ── dialog: change a proxy's login, entry or address ───────────────────── */
+
+function openProxyEdit(t, what) {
+  const f = $("#formProxyEdit"), body = $("#proxyEditBody");
+  const save = f.querySelector('button[value="ok"]');
+  const problem = el("div", {});
+  save.disabled = false;
+  let collect;
+
+  if (what === "login") {
+    $("#proxyEditTitle").textContent = `Change login · ${t.slug}`;
+    const user = el("input", { name: "username", autocomplete: "off",
+                               spellcheck: "false", value: t.username || "" });
+    const pass = el("input", { name: "password", type: "password",
+      autocomplete: "new-password", placeholder: t.has_password ? "unchanged" : "" });
+    body.replaceChildren(
+      el("p", { class: "hint" }, "Leave the password empty to keep the one "
+        + "that is set. Clear both to use no login, for a proxy that admits "
+        + "callers by address."),
+      el("div", { class: "field-row" },
+        el("label", { class: "field" }, el("span", {}, "Username"), user),
+        el("label", { class: "field" }, el("span", {}, "Password"), pass)));
+    collect = () => {
+      const username = user.value.trim(), password = pass.value;
+      if (username && !password && !t.has_password)
+        throw new Error("Enter the password too.");
+      if (!username && password)
+        throw new Error("A password needs a username.");
+      return { username, password };
+    };
+  } else if (what === "entry") {
+    $("#proxyEditTitle").textContent = `Change entry · ${t.slug}`;
+    const entries = proxyEntries(t.via);
+    const usable = entries.find((x) => x.state !== "down");
+    const sel = el("select", { name: "via" }, ...entries.map(entryOption));
+    if (usable) sel.value = usable.slug;
+    body.replaceChildren(
+      el("p", { class: "hint" }, `${t.slug} is reached through ${t.via} now. `
+        + "Through another tunnel, the proxy's provider sees that tunnel's "
+        + "exit instead, and the proxy's name is looked up through it again."),
+      usable
+        ? el("label", { class: "field" }, el("span", {}, "Route through"), sel)
+        : blockedNotice("No other tunnel can carry it right now.",
+            "It needs a tunnel that is up, switched on, and not itself the "
+            + "second hop of a double VPN."));
+    save.disabled = !usable;
+    collect = () => ({ via: sel.value });
+  } else {
+    $("#proxyEditTitle").textContent = `Change address · ${t.slug}`;
+    let type = t.proxy?.type || "socks5";
+    const seg = el("div", { class: "seg" }, ...Object.entries(PROXY_TYPES).map(
+      ([k, label]) => el("button", { type: "button", "data-type": k,
+        class: k === type ? "on" : "", "aria-pressed": String(k === type),
+        onclick: () => {
+          type = k;
+          for (const b of seg.children) {
+            b.classList.toggle("on", b.dataset.type === k);
+            b.setAttribute("aria-pressed", String(b.dataset.type === k));
+          }
+        } }, label)));
+    const host = el("input", { name: "host", required: true, autocomplete: "off",
+                               spellcheck: "false", value: t.proxy?.host || "" });
+    const port = el("input", { name: "port", required: true, inputmode: "numeric",
+      maxlength: "5", pattern: "[0-9]{1,5}", autocomplete: "off",
+      value: String(t.proxy?.port || "") });
+    body.replaceChildren(
+      el("p", { class: "hint" }, `Where ${t.slug}'s proxy server is. Its name `
+        + `is looked up through ${t.via}, never over the uplink.`),
+      el("div", { class: "field-row three" },
+        el("div", { class: "field" }, el("span", {}, "Type"), seg),
+        el("label", { class: "field" }, el("span", {}, "Server ", el("em", {}, "*")), host),
+        el("label", { class: "field" }, el("span", {}, "Port ", el("em", {}, "*")), port)));
+    collect = () => ({ type, host: host.value.trim(), port: Number(port.value) });
+  }
+  body.append(problem);
+
+  f.onsubmit = async (ev) => {
+    if (ev.submitter?.value === "cancel") return;
+    ev.preventDefault();
+    try {
+      await api("/api/tunnels/" + t.slug, "PATCH", collect());
+    } catch (err) {
+      problem.replaceChildren(verdictView({ ok: false, message: err.message }));
+      return;
+    }
+    $("#dlgProxyEdit").close();
+    toast("ok", { login: "Login changed", entry: "Entry changed" }[what]
+                || "Address changed", "The relay restarts with it; testing it now.");
+    await refresh();
+    runProxyTest(t, 4000);
+  };
+  $("#dlgProxyEdit").showModal();
+}
+
+// The inputs go with the dialog, and a typed password with them. The close
+// event arrives a task later, so a dialog reopened meanwhile is left alone.
+$("#dlgProxyEdit").addEventListener("close", () => {
+  if (!$("#dlgProxyEdit").open) $("#proxyEditBody").replaceChildren();
+});
 
 /** The lowest address in the client network that nothing is using yet.
  *
@@ -2321,7 +3009,22 @@ function openClientDialog(client) {
   } else {
     f.ip.readOnly = false;
   }
+  $("#clientEgress").onchange = updateClientProxyNotice;
+  f.name.oninput = updateClientProxyNotice;
+  updateClientProxyNotice();
   $("#dlgClient").showModal();
+}
+
+/** Said when a proxy is picked, before the client is moved onto it - not
+ *  after its first video call fails. */
+function updateClientProxyNotice() {
+  const f = $("#formClient"), box = $("#clientProxyNotice");
+  const on = egressIsProxy(f.egress.value);
+  box.classList.toggle("hidden", !on);
+  if (on) box.lastElementChild.replaceChildren(el("b", {}, "TCP only."),
+    ` Video calls, online games and other UDP traffic from `
+    + `${f.name.value.trim() || "this client"} won't work on this exit. `
+    + "Web browsing and downloads will.");
 }
 
 $("#formClient").addEventListener("submit", async (ev) => {
@@ -2349,7 +3052,8 @@ $("#formClient").addEventListener("submit", async (ev) => {
 
 let poolOrder = [];
 function openPoolDialog() {
-  poolOrder = S.snap.tunnels.map((t) => ({ slug: t.slug, name: t.name, on: false }));
+  poolOrder = S.snap.tunnels.filter((t) => !isProxy(t))
+    .map((t) => ({ slug: t.slug, name: t.name, on: false }));
   $("#formPool").reset();
   renderPoolPicker();
   $("#dlgPool").showModal();
@@ -2391,7 +3095,20 @@ function renderPoolPicker() {
         title: "Move down", onclick: () => move(1) }, "↓"));
   });
 
-  host.replaceChildren(...rows);
+  // Proxies are shown, not offered: failing over between a VPN and a proxy
+  // would silently change what works for a client, since only one of the
+  // two carries UDP.
+  const proxies = (S.snap?.tunnels || []).filter(isProxy);
+  host.replaceChildren(...rows, ...proxies.map((t) =>
+    el("div", { class: "picker-row off" },
+      el("input", { type: "checkbox", disabled: true,
+                    "aria-label": `${t.name}: a proxy cannot join a pool` }),
+      el("span", { class: "order" }, "—"),
+      el("div", { class: "grow", style: "min-width:0" },
+        el("div", {}, t.name, el("span", { class: "sub" }, " · proxy")),
+        el("div", { class: "mono", style: "font-size:11px;color:var(--text-3)" },
+          `${t.slug} · via ${t.via}`)),
+      tcpTag())));
 
   // A chained exit next to its own entry: if the entry dies, both die.
   // Worth having - exit-provider failure still fails over - but only when
@@ -2411,6 +3128,16 @@ function renderPoolPicker() {
         `${t.name} rides through ${t.via}, which is also in this pool - if `
         + `${t.via} dies they die together, and only the exit provider `
         + `failing actually fails over.`).join(" ")
+    : "";
+  let pxNote = $("#poolProxyNote");
+  if (!pxNote) {
+    pxNote = el("small", { id: "poolProxyNote", style: "line-height:1.45" });
+    warn.after(pxNote);
+  }
+  pxNote.textContent = proxies.length
+    ? "Proxies can't join a pool yet: failing over between a VPN and a proxy "
+      + "would silently change what works for a client, because only one of "
+      + "them carries UDP."
     : "";
 
   const summary = $("#poolSummary");
@@ -3202,6 +3929,9 @@ function render(options = {}) {
   host.replaceChildren();
   RENDERERS[S.page](host);
   if (S.drawerSlug) renderDrawer();
+  // The add-proxy dialog is not re-rendered by the poll; its chain preview
+  // is, so an entry that goes down while the form is open shows it.
+  drawProxyPreview();
 }
 
 /** True while the sign-in card is covering the page. */

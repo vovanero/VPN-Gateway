@@ -36,7 +36,37 @@ never a command line - and no API returns it.
 **Bounded cost.** Residential proxies are usually billed by the byte, so once
 UP a proxy is re-measured every 30 s, and a DOWN one no more often: a dead
 proxy must not hold the reconcile loop that every other tunnel's failover runs
-in.
+in. A state on its way to changing - a first good probe after DOWN, a first
+failure after UP - is measured every pass until it settles, and a relay
+rebuilt with a new login, address or entry is measured on the same pass, so
+the panel does not contradict a test that has just passed.
+
+**In the panel.** "Add tunnel" has a Proxy tab. Paste what the provider gives
+you - `socks5://user:pass@host:port`, `host:port:user:pass` - and it becomes
+fields, with the password moved out of the address into a masked field at
+once. "Route through" is required and lists only tunnels that can carry a
+proxy, fastest first; there is no "directly". Add proxy saves it, tests it
+through the chain, and keeps it only if it works: otherwise it is deleted
+again and the form stays as it was, saying which link broke. Proxies appear
+in the chains section, with Change entry in place of Unchain; in a group of
+their own in the client exit list, with "TCP only" beside each and a notice
+the moment one is picked; and as unpickable rows in the pool builder. A
+proxy's drawer leads with what is wrong and the button that fixes it - Change
+login when the login was rejected, Open the entry tunnel when that is down -
+then draws the path hop by hop, red only where it broke.
+
+**Also in this release.**
+
+- The OpenVPN username and password from the import dialog travelled in the
+  URL's query string. They now go in the request body, with the file.
+- The page names `app.js` and `app.css` by their content. Browsers reuse those
+  files for hours on a heuristic, which after an update ran an old script
+  against a new page.
+- The short-name fields' pattern was not valid under the `v` flag that current
+  browsers compile patterns with, so it was dropped and checked nothing; the
+  server's own check was the only one.
+- A proxy that wants a login, and one that takes none, are told apart from a
+  rejected password: three different fixes, three different messages.
 
 redsocks is an optional package, installed through the tunnel `vpngw-update`
 fetches the release through, over HTTPS, and checked by apt against the signed

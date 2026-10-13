@@ -61,8 +61,11 @@ def socks5(s: socket.socket, user: str, password: str,
     if ver != 5:
         return _result("connect", False, "the server is not a SOCKS5 proxy")
     if chosen == 0xFF:
+        # Offered no login and refused: it wants one. Offered a login and
+        # refused: it takes none - typically a proxy that admits callers by
+        # address instead. Two different fixes, so two different answers.
         return _result("auth", False,
-                       "the proxy accepts none of the offered login methods")
+                       "refuses a username and password" if user else "needs a login")
     if chosen == 0x02:
         u, p = user.encode(), password.encode()
         s.sendall(bytes([1, len(u)]) + u + bytes([len(p)]) + p)
@@ -104,7 +107,7 @@ def http_connect(s: socket.socket, user: str, password: str,
         return _result("connect", False, "the server is not an HTTP proxy")
     code = int(status[1])
     if code == 407:
-        return _result("auth", False, "login rejected")
+        return _result("auth", False, "login rejected" if user else "needs a login")
     if 200 <= code < 300:
         return _result("ok", True)
     return _result("tunnel", False, f"the proxy answered {code}")

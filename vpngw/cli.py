@@ -928,8 +928,11 @@ def _live_egress(daemon: "Daemon", db: Database) -> str:
         raise SystemExit("no enabled tunnel to test; pass --egress")
     try:
         status = daemon.call("/api/status")
+        # Not a proxy: it carries TCP only, and the suite's checks are
+        # written for an exit that carries everything.
         live = {t["slug"] for t in status.get("tunnels", [])
-                if t.get("state") == "up" and t.get("routed")}
+                if t.get("state") == "up" and t.get("routed")
+                and t.get("kind") != "proxy"}
     except Exception:
         live = set()
     for t in enabled:

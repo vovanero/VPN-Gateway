@@ -72,13 +72,16 @@ def apply_log_level(name: str) -> None:
 
 
 def _proxy_row(t: Tunnel) -> dict:
-    from .tunnels.proxy import read_credentials
+    from .tunnels.proxy import last_stage, read_credentials
     try:
         username, password = read_credentials(t.slug)
     except (OSError, ValueError):
         username, password = "", ""
     return {"proxy": dict(t.proxy), "username": username,
-            "has_password": bool(password)}
+            "has_password": bool(password),
+            # Which step failed last: "auth", "resolve", "connect"... The
+            # message itself is last_error; this picks the button beside it.
+            "proxy_stage": last_stage(t.slug)}
 
 
 class Service:
