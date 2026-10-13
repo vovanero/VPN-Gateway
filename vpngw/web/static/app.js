@@ -29,6 +29,8 @@ const S = {
   // re-renders the whole page every few seconds and would otherwise wipe the
   // report a second after it appeared.
   test: { status: "idle", checks: [], ok: null, error: null, at: null },
+  // The exit the leak test runs through, when the operator picked one.
+  testTarget: null,
   providers: [],
   session: null,
   network: null,
@@ -2038,6 +2040,7 @@ function renderSecurity(host) {
         el("div", {}, el("h3", {}, "Leak test"),
           el("p", {}, "Attaches a real network client to the client bridge, generates traffic, and measures whether anything reaches the uplink.")),
         el("div", { class: "row" },
+          testTargetSelect(),
           el("button", { class: "btn", disabled: S.test.status === "running",
             onclick: () => runSelftest(false) }, icon("play"), "Run test"),
           el("button", { class: "btn danger", disabled: S.test.status === "running",
@@ -2148,7 +2151,28 @@ const CHECK_TR = {
   disrupt_tcpdump: "No packet reached the uplink (tcpdump)",
   disrupt_counters: "The attempt was recorded by the firewall",
   disrupt_blackhole: "The routing table fell back to its blackhole",
+  no_icmp_redirects: "The gateway does not teach clients to bypass it",
+  proxy_exit_not_entry: "The exit is the proxy's, not the entry tunnel's",
+  proxy_server_via_entry: "The proxy is dialled only through its entry tunnel",
+  proxy_udp_refused: "Client UDP is refused, not sent around the proxy",
+  proxy_dns_through_proxy: "DNS is resolved through the proxy, over TCP",
+  disrupt_relay_stopped: "With the relay stopped, nothing goes around it",
+  disrupt_proxy_server: "The proxy is not dialled over the uplink",
 };
+
+/** Which exit the leak test client is put on. A VPN tunnel by default; a
+ *  proxy when one is picked, which adds the checks only a proxy needs. */
+function testTargetSelect() {
+  const live = S.snap.tunnels.filter((t) => t.enabled && t.state === "up" && t.routed);
+  if (live.length < 2) return null;
+  const current = live.find((t) => t.slug === S.testTarget)
+    || live.find((t) => !isProxy(t)) || live[0];
+  return el("select", { title: "The exit the test client is assigned to",
+      disabled: S.test.status === "running",
+      onchange: (e) => { S.testTarget = e.target.value; } },
+    ...live.map((t) => el("option", { value: t.slug, selected: t === current },
+      `Through ${t.name}${isProxy(t) ? " · proxy" : ""}`)));
+}
 
 async function runSelftest(disrupt) {
   const s = S.snap;
@@ -2160,9 +2184,10 @@ async function runSelftest(disrupt) {
   // failures" - the kill switch correctly blackholing a dead tunnel, read as
   // the worst result the suite has.
   //
-  // Not through a proxy: it carries TCP only, and these checks are written
-  // for an exit that carries everything.
-  const target = enabled.find((t) => !isProxy(t) && t.state === "up" && t.routed);
+  // Not through a proxy unless one was picked: it carries TCP only, and a
+  // proxy is tested with checks of its own on top of these.
+  const target = enabled.find((t) => t.slug === S.testTarget && t.state === "up" && t.routed)
+    || enabled.find((t) => !isProxy(t) && t.state === "up" && t.routed);
   if (!target) {
     toast("err", "No tunnel is up",
       "There is nothing to send test traffic through. That is not a leak — " +
@@ -2171,8 +2196,9 @@ async function runSelftest(disrupt) {
   }
 
   if (disrupt) {
-    const ok = await confirmDialog("Run the disruptive test?",
-      `'${target.name}' will actually be taken down while we measure whether anything escapes to the uplink. Clients on it lose connectivity for roughly twenty seconds.`,
+    const ok = await confirmDialog("Run the disruptive test?", isProxy(target)
+      ? `'${target.name}' is tested under its own two failures: its relay is stopped, then its entry tunnel '${target.via}' is taken down. Clients on both lose connectivity for roughly half a minute.`
+      : `'${target.name}' will actually be taken down while we measure whether anything escapes to the uplink. Clients on it lose connectivity for roughly twenty seconds.`,
       "Run it");
     if (!ok) return;
   }

@@ -214,6 +214,69 @@ source address, so it does not wait for existing flows to expire.
 
 In the web UI it is the dropdown in the client table.
 
+## Proxies
+
+A SOCKS5 or HTTP proxy - a residential proxy, typically - can be an exit, the
+way a tunnel is. It is always reached through one of your WireGuard or OpenVPN
+tunnels, its **entry**: dialled directly, the proxy's provider would see this
+gateway's real address, and the login would cross the ISP's wire in the clear.
+There is no option to do that, in the panel or the CLI.
+
+```bash
+vpngwctl tunnel add-proxy res-de1 socks5://customer-7f3a@gate.example.net:7000 \
+    --via nl01 --name "Residential Germany"
+vpngwctl tunnel test res-de1
+vpngwctl client assign 10.10.0.11 tunnel:res-de1
+```
+
+The password is asked for, or read with `--password-file`; one in the URL is
+refused, because a command line is readable by every local account. In the
+panel it is **Add tunnel › Proxy**: paste the address the provider gives you -
+`socks5://user:pass@host:port` and `host:port:user:pass` both work - and the
+password moves to its masked field at once. **Add proxy** saves it, tests it
+through the chain, and keeps it only if the test passes; otherwise it is
+deleted again and the form says which link broke.
+
+The proxy server's name is looked up through the entry tunnel, never over the
+uplink. `https://` proxies (TLS to the proxy itself) are not supported yet; if
+the provider also offers `http://`, use that - what you reach through it is
+still HTTPS end to end.
+
+**TCP only.** A proxy carries TCP. UDP from its clients - QUIC, video calls,
+games, VoIP - is refused with an ICMP error, so browsers fall back to TCP at
+once and nothing is sent around the proxy. The panel says so wherever a proxy
+can be picked. Proxies cannot join pools: failing over between a VPN and a
+proxy would silently change what works for a client.
+
+**Changing one.** In its drawer: Change login (an empty password keeps the
+current one), Change entry, and Change address. The relay restarts with the
+change and is tested straight away. From the CLI:
+
+```bash
+vpngwctl tunnel login res-de1 --user customer-7f3a-session-92
+```
+
+**Cost.** Residential proxies are usually billed by the byte. A healthy proxy
+is probed every 30 seconds with one small HTTPS request through the chain; a
+proxy whose state is changing is probed every pass until it settles.
+
+**When it breaks**, the message names the link:
+
+| Message | Means | Do |
+|---|---|---|
+| `<entry> is down, so <proxy> can't reach its proxy.` | the entry tunnel is down | fix the entry, or Change entry |
+| `<host> couldn't be resolved through <entry>.` | the name does not resolve where the entry exits | Change address |
+| `The proxy at <host>:<port> didn't answer through <entry>.` | nothing answers at that address and port | check the address; some providers admit only allow-listed callers |
+| `The proxy rejected the username or password.` | the login is wrong | Change login |
+| `The proxy wants a username and password, and none is set.` | it needs a login | Change login |
+| `The proxy does not take a username and password...` | it admits by caller address instead | clear the login; see below |
+| `The proxy accepted the login but would not connect onward...` | the proxy refuses the destination | the provider's own rules |
+| `The proxy relay stopped...` | redsocks exited | it restarts by itself; see `journalctl -u vpngw-proxy@<slug>` |
+
+Prefer a proxy that asks for a username and password. One that admits callers
+by address would have to admit the entry tunnel's exit - which every other
+customer of that VPN provider shares.
+
 ## Health
 
 Two signals, in order: a protocol hint (WireGuard handshake age, OpenVPN unit

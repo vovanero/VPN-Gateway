@@ -356,6 +356,12 @@ class ProxyDriver(TunnelDriver):
         if not try_run(["systemctl", "is-active", "--quiet",
                         RELAY_UNIT.format(slug=t.slug)]).ok:
             return False, "the proxy relay is not running"
+        # The health probe asks for an address, not a name, so it cannot
+        # notice a dead resolver on its own - while every client of this
+        # proxy can, the moment it tries to look anything up.
+        if not try_run(["systemctl", "is-active", "--quiet",
+                        DNS_UNIT.format(slug=t.slug)]).ok:
+            return False, "the proxy's resolver is not running"
         return None, ""
 
     def diagnose(self, t: Tunnel, *, fresh: bool = False) -> dict:

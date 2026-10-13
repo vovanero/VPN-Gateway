@@ -93,6 +93,38 @@ are on the pool. Ten clients do not need ten updates, and there is no window
 where half of them have moved. It also means "assign this client to a pool" and
 "assign it to a tunnel" are literally the same code path — see `models.Egress`.
 
+### A proxy exit
+
+A proxy is an egress like a tunnel is - same esid, mark, table and resolver -
+whose interface is `px-<slug>`: one end of a veth pair whose other end, `px0`,
+is in the network namespace `vpngw-px-<slug>`. The link addresses come from
+`169.254.240.0/20`, four per esid (`config.proxy_link`). Two legs, and both
+cross the host's forward chain:
+
+```
+   client ─► table 100+esid ─► px-<slug> ═══ px0 ─► redsocks :12345
+                                                   (pxdns :5353 turns the
+                                                    resolver's UDP into TCP)
+   redsocks ─► px0 ═══ px-<slug> ─► mark := entry's (@px_entry)
+             ─► entry's table ─► wg-<entry> ─► the proxy server
+```
+
+The second leg is admitted only by `@px_upstream` (interface . address . port)
+and only towards a tunnel interface; anything else arriving from a proxy
+interface is dropped and counted. Inside, the namespace's own ruleset lets
+nothing out but TCP to that one server, and the relay runs as a `DynamicUser`
+with no capabilities, its login handed over as a systemd credential. The
+health probe is an HTTPS request made inside the namespace, through the relay,
+because ICMP does not cross a proxy.
+
+A proxy is never an outer tunnel. It gets no priority-850 rule: its relay's
+traffic is steered by `@px_entry` into the entry's own rule, and the API
+refuses to chain anything through a proxy.
+
+Namespaces are created and deleted in the host's mount namespace (`nsenter
+--mount=/proc/1/ns/mnt`). The daemon runs with a private one, and a namespace
+mounted from inside it is invisible to the systemd units that must join it.
+
 ## The single writer
 
 Everything that touches kernel state goes through one loop in one thread
@@ -155,6 +187,9 @@ had a moment ago.
 | `render/openvpn.py` | Neutralises provider directives | Strips `redirect-gateway`, `route`, `up`/`down`, … |
 | `tunnels/wg.py` | WireGuard without `wg-quick` | wg-quick's route/fwmark magic is what leaks |
 | `tunnels/ovpn.py` | OpenVPN under systemd | Not `PartOf=vpngw` — tunnels outlive the control plane |
+| `tunnels/proxy.py` | SOCKS5 and HTTP proxy exits: namespace, relay, probe | The relay never runs on the host |
+| `pxdns.py` | UDP-to-TCP DNS inside a proxy's namespace | Lookups leave where the traffic leaves |
+| `proxycheck.py` | Which step of reaching a proxy fails | Run inside the namespace; the login comes on stdin |
 | `health.py` | Protocol hint, then bound probe, with hysteresis | `ping -I` uses SO_BINDTODEVICE: tests the tunnel, not the routing |
 | `pools.py` | Member selection, stickiness | Returns `None` rather than a fallback when all are down |
 | `dnsmgr.py` | One resolver per egress | `server=<up>@<source>` is what confines lookups |

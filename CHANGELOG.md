@@ -55,6 +55,24 @@ proxy's drawer leads with what is wrong and the button that fixes it - Change
 login when the login was rejected, Open the entry tunnel when that is down -
 then draws the path hop by hop, red only where it broke.
 
+**Proven, not claimed.** With a proxy as its exit, `vpngwctl selftest` adds
+four checks, each watched on the uplink, inside the entry tunnel and on the
+veth into the namespace: the client exits with the proxy's address and not
+the entry's; the proxy server is reached through the entry and never appears
+on the uplink; client UDP is refused and turns up nowhere; and a lookup of a
+fresh name is answered without that name ever appearing as plain DNS past the
+namespace. `--disrupt` then stops the relay - nothing may reach the internet
+through the entry instead - and takes the entry down - the relay must not
+reach for its server over the uplink - with the proxy's route kept in place,
+so it is the namespace that refuses, not the routing blackhole. The panel's
+leak test can now be pointed at any live exit, a proxy included.
+
+**Found while proving it.** The resolver unit is bound to the relay and stops
+with it; when the relay crashed and systemd restarted it, nothing restarted
+the resolver, so the proxy stayed "up" - its probe asks for an address, not a
+name - while every client of it had lost DNS. The relay unit now upholds its
+resolver, and the health check also requires the resolver to be running.
+
 **Also in this release.**
 
 - The OpenVPN username and password from the import dialog travelled in the

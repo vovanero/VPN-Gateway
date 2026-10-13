@@ -29,8 +29,8 @@ import time
 from dataclasses import dataclass, field
 
 from . import config
-from .models import Client, EgressKind, ValidationError
-from .net import ifaces, nft
+from .models import Client, EgressKind, TunnelKind, ValidationError
+from .net import ifaces, nft, routing
 from .net.shell import run, try_run
 
 log = logging.getLogger("vpngw.leaktest")
@@ -43,6 +43,7 @@ VETH_NS = "vt-ns"
 # packet seen on the uplink with this port is unambiguous evidence of a leak.
 CANARY_HOST = "203.0.113.9"      # TEST-NET-3, never routed
 CANARY_PORT = 51999
+CANARY_BPF = f"port {CANARY_PORT} or host {CANARY_HOST}"
 
 
 @dataclass
@@ -193,18 +194,27 @@ class LeakTest:
                 return line[3:].strip()
         return None
 
-    class _UplinkWatch:
-        """tcpdump on the uplink, looking only for the canary."""
+    class _Watch:
+        """tcpdump on one interface, keeping the lines that name a needle.
 
-        def __init__(self, iface: str) -> None:
-            self.iface = iface
+        Address and port filters only: nothing is resolved, so a watch can
+        never itself put a lookup on the wire it is watching.
+        """
+
+        def __init__(self, iface: str, bpf: str, needles: list[str],
+                     *, payload: bool = False, count: int = 2000) -> None:
+            self.iface, self.bpf, self.needles = iface, bpf, needles
+            self.payload, self.count = payload, count
             self.proc: subprocess.Popen | None = None
 
-        def __enter__(self) -> "LeakTest._UplinkWatch":
+        def __enter__(self) -> "LeakTest._Watch":
+            argv = ["tcpdump", "-i", self.iface, "-n", "-l", "-c", str(self.count)]
+            if self.payload:
+                argv.append("-A")
             self.proc = subprocess.Popen(
-                ["tcpdump", "-i", self.iface, "-n", "-l", "-c", "50",
-                 f"port {CANARY_PORT} or host {CANARY_HOST}"],
+                argv + [self.bpf],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                errors="replace",
             )
             time.sleep(1.5)  # let the capture actually attach
             return self
@@ -229,7 +239,14 @@ class LeakTest:
                 self.proc.kill()
                 return []
             return [l for l in (out or "").splitlines()
-                    if CANARY_HOST in l or str(CANARY_PORT) in l]
+                    if any(n in l for n in self.needles)]
+
+    class _UplinkWatch(_Watch):
+        """tcpdump on the uplink, looking only for the canary."""
+
+        def __init__(self, iface: str) -> None:
+            super().__init__(iface, CANARY_BPF, [CANARY_HOST, str(CANARY_PORT)],
+                             count=50)
 
     # -- the suite ----------------------------------------------------------
 
@@ -272,6 +289,14 @@ class LeakTest:
                 "clean" if not captured
                 else f"{len(captured)} packet(s) seen on {wan}: {captured[:2]}",
             )
+
+            # 2b. a proxy exit's own way to fail --------------------------
+            proxy = (self.db.tunnel(egress_slug)
+                     if egress_kind is EgressKind.TUNNEL else None)
+            if proxy is not None and proxy.kind is not TunnelKind.PROXY:
+                proxy = None
+            if proxy is not None:
+                self._check_proxy(report, proxy, exit_ip)
 
             # 3. unassigned client is dropped ------------------------------
             client = self.db.client(self.test_ip)
@@ -344,7 +369,9 @@ class LeakTest:
             self._check_boot_order(report)
 
             # 7. the real test ---------------------------------------------
-            if disrupt:
+            if disrupt and proxy is not None:
+                self._check_disrupted_proxy(report, proxy, wan)
+            elif disrupt:
                 self._check_disrupted(report, egress_kind, egress_slug, wan)
             else:
                 report.add(
@@ -473,6 +500,223 @@ class LeakTest:
                 if line.replace(" ", "").startswith("net.ipv4.ip_forward=0"):
                     return True
         return False
+
+    def _check_proxy(self, report: Report, t, exit_ip: str | None) -> None:
+        """What only a proxy exit can get wrong: going around the proxy.
+
+        A tunnel either carries a packet or blackholes it. A proxy exit has a
+        third way to fail. Traffic that leaves through the entry tunnel
+        without passing the proxy is no leak to the ISP, but it shows the
+        destination the entry's address instead of the proxy's - the one
+        thing the operator chose a proxy to change. Every observation is
+        made at three points: the uplink, inside the entry tunnel, and on
+        the veth into the proxy's namespace.
+        """
+        import secrets
+
+        from .tunnels.proxy import server_of
+
+        wan = self.settings.net.wan_iface
+        entry = self.db.tunnel(t.via)
+        if entry is None or not t.endpoints:
+            report.add("proxy_server_via_entry",
+                       "the proxy is dialled only through its entry tunnel", False,
+                       f"cannot check: {t.via!r} is missing" if entry is None
+                       else f"cannot check: {t.proxy.get('host')} is not resolved")
+            return
+        server, port = server_of(t), int(t.proxy["port"])
+        to_server = f"host {server} and tcp port {port}"
+        label = "vpngw-" + secrets.token_hex(5)
+        before = nft.counters()
+
+        with self._Watch(wan, f"host {server} or port 53 or {CANARY_BPF}",
+                         [server, label, CANARY_HOST, str(CANARY_PORT)]) as on_wan, \
+             self._Watch(entry.iface, f"({to_server}) or udp port 53 or {CANARY_BPF}",
+                         [server, label, CANARY_HOST, str(CANARY_PORT)]) as in_entry, \
+             self._Watch(t.iface, f"udp and ({CANARY_BPF})",
+                         [" IP ", " IP6 "]) as into_ns, \
+             self._Watch(t.iface, f"tcp and {to_server}", [label],
+                         payload=True) as stream:
+            self._reaches_internet(timeout=8)
+            self._canary(count=3)
+            asked = self._ns("dig", "+time=5", "+tries=1",
+                             f"@{self.settings.dns.resolver_ip(t.esid)}",
+                             f"{label}.example.com", timeout=12)
+            wan_lines, entry_lines = on_wan.captured(), in_entry.captured()
+            ns_udp, in_stream = into_ns.captured(), stream.captured()
+        refused = self._delta(before, nft.counters(), "proxy_nontcp_drop")
+
+        # 1. The exit is the proxy's. ------------------------------------
+        entry_exit = self.service.reconciler.health.get(entry.slug).exit_ip
+        if exit_ip and entry_exit:
+            report.add(
+                "proxy_exit_not_entry", "the exit is the proxy's, not the entry tunnel's",
+                exit_ip != entry_exit,
+                f"exits as {exit_ip}; {entry.slug} exits as {entry_exit}"
+                if exit_ip != entry_exit
+                else f"AROUND THE PROXY - the client exits as {entry.slug}'s own "
+                     f"address {exit_ip}")
+        else:
+            report.add("proxy_exit_not_entry",
+                       "the exit is the proxy's, not the entry tunnel's", False,
+                       "not measured: " + ("the client reached nothing" if not exit_ip
+                                           else f"{entry.slug}'s exit is not known yet"),
+                       critical=False)
+
+        # 2. Rule 2: the proxy is dialled through the entry, never the WAN.
+        dialled_wan = [l for l in wan_lines if server in l]
+        dialled_entry = [l for l in entry_lines if server in l]
+        ok = not dialled_wan and bool(dialled_entry)
+        report.add(
+            "proxy_server_via_entry", "the proxy is dialled only through its entry tunnel",
+            ok,
+            f"{len(dialled_entry)} packet(s) to {server}:{port} inside {entry.iface}, "
+            f"none on {wan}" if ok
+            else f"LEAKED - {len(dialled_wan)} packet(s) to {server} on {wan}: "
+                 f"{dialled_wan[:2]}" if dialled_wan
+            else f"no packet to {server} was seen inside {entry.iface} either, so "
+                 f"this capture proves nothing",
+            critical=ok or bool(dialled_wan))
+
+        # 3. UDP is refused, three ways.
+        canary = (CANARY_HOST, str(CANARY_PORT))
+        around = [l for l in entry_lines if any(c in l for c in canary)]
+        out = [l for l in wan_lines if any(c in l for c in canary)]
+        into = [l for l in ns_udp if any(c in l for c in canary)]
+        ok = refused > 0 and not around and not out and not into
+        seen = around or out or into
+        report.add(
+            "proxy_udp_refused", "client UDP is refused, not sent around the proxy",
+            ok,
+            f"refused (proxy_nontcp_drop +{refused}); none on {wan}, inside "
+            f"{entry.iface} or into the namespace" if ok
+            else f"AROUND THE PROXY - {len(seen)} packet(s): {seen[:2]}" if seen
+            else "no packet was seen anywhere, but proxy_nontcp_drop did not move "
+                 "either: the UDP was stopped somewhere this test does not watch",
+            critical=ok or bool(seen))
+
+        # 4. DNS goes through the proxy, over TCP.
+        # The resolver's UDP into the namespace is by design - pxdns, in
+        # there, turns it into TCP through the relay - so the veth is not
+        # where to look. Plain DNS carrying this name anywhere past the
+        # namespace would be the leak: on the uplink, or inside the entry.
+        answered = asked.ok and "status:" in (asked.stdout or "")
+        leaked = [l for l in wan_lines + entry_lines if label in l]
+        ok = answered and not leaked
+        report.add(
+            "proxy_dns_through_proxy", "DNS is resolved through the proxy, over TCP",
+            ok,
+            ("answered; the name crossed the proxy over TCP and appeared nowhere "
+             "else" if in_stream else
+             "answered; the name appeared nowhere outside the proxy") if ok
+            else f"AROUND THE PROXY - the lookup appeared as plain DNS: "
+                 f"{leaked[:2]}" if leaked
+            else "the lookup got no answer, so this proves nothing",
+            critical=ok or bool(leaked))
+
+    def _check_disrupted_proxy(self, report: Report, t, wan: str) -> None:
+        """A proxy exit under the two failures that are its own.
+
+        First its relay stops while everything else is up: a client must then
+        reach nothing, rather than be carried by the entry tunnel without the
+        proxy. Then the entry tunnel goes down: the relay must not reach for
+        its proxy over the uplink, where the proxy's provider would see this
+        gateway's own address. Clients on the entry and on the proxy lose
+        connectivity for the duration.
+        """
+        from .tunnels import driver_for
+        from .tunnels.proxy import DNS_UNIT, RELAY_UNIT, server_of
+
+        entry = self.db.tunnel(t.via)
+        if entry is None or not t.endpoints:
+            report.add("disrupt_no_targets", "kill switch under tunnel failure",
+                       False, f"{t.slug} has no entry or no resolved server to test")
+            return
+        server = server_of(t)
+        units = [RELAY_UNIT.format(slug=t.slug), DNS_UNIT.format(slug=t.slug)]
+        log.warning("stopping %s's relay, then taking %s down; clients on them "
+                    "lose connectivity for the duration of this test",
+                    t.slug, entry.slug)
+
+        # A hold keeps the loop's hands off, but it also withdraws the held
+        # tunnels' routes - and with the proxy's route gone, this would only
+        # re-test the routing blackhole. Put that route back, so what refuses
+        # the client is the namespace and the relay, which is the point.
+        into_namespace = (t.table, t.iface, config.proxy_link(t.esid)[1])
+
+        # 1. The relay stops. --------------------------------------------
+        with self.service.reconciler.hold([t.slug]):
+            try_run(["systemctl", "stop", *units])
+            routing.set_default_via(*into_namespace)
+            time.sleep(1)
+            with self._UplinkWatch(wan) as on_wan, \
+                 self._Watch(entry.iface, CANARY_BPF,
+                             [CANARY_HOST, str(CANARY_PORT)]) as in_entry:
+                self._canary(count=3)
+                reachable = self._reaches_internet(timeout=5)
+                routed = routing.table_default(t.table) == t.iface
+                seen = on_wan.captured() + in_entry.captured()
+            try_run(["systemctl", "start", *units])
+            time.sleep(2)
+        report.add(
+            "disrupt_relay_stopped",
+            f"with {t.slug}'s relay stopped, nothing goes around it",
+            reachable is None and not seen,
+            ("blocked inside the namespace, its route in place" if routed
+             else "blocked, though its route had been withdrawn")
+            + f"; nothing on {wan} or inside {entry.iface}"
+            if reachable is None and not seen
+            else f"AROUND THE PROXY - the client still reached the internet as "
+                 f"{reachable}" if reachable
+            else f"LEAKED - {len(seen)} packet(s): {seen[:3]}")
+
+        # 2. The entry goes down. ----------------------------------------
+        with self.service.reconciler.hold([entry.slug, t.slug]):
+            driver_for(entry).down(entry)
+            routing.set_default_via(*into_namespace)
+            time.sleep(2)
+            with self._Watch(wan, f"{CANARY_BPF} or host {server}",
+                             [CANARY_HOST, str(CANARY_PORT), server],
+                             count=200) as watch, \
+                 self._Watch(t.iface, f"tcp and host {server}", [server],
+                             count=200) as tries:
+                self._canary(count=6)
+                reachable = self._reaches_internet(timeout=5)
+                captured = watch.captured()
+                tried = [l for l in tries.captured() if f"> {server}" in l]
+            blackholed = self._table_has_only_blackhole(entry.table)
+
+        dialled = [l for l in captured if server in l]
+        leaked = [l for l in captured if l not in dialled]
+        report.add(
+            "disrupt_unreachable",
+            f"internet is unreachable while {entry.slug} is down",
+            reachable is None,
+            "blocked" if reachable is None
+            else f"LEAKED - client still reached the internet as {reachable}")
+        report.add(
+            "disrupt_tcpdump", "nothing reached the uplink (tcpdump)",
+            not leaked,
+            f"0 packets on {wan}" if not leaked
+            else f"LEAKED - {len(leaked)} packet(s): {leaked[:3]}")
+        report.add(
+            "disrupt_proxy_server",
+            f"the proxy was not dialled over the uplink while {entry.slug} was down",
+            not dialled,
+            (f"the relay tried {server} {len(tried)} time(s); none of it reached "
+             f"{wan}" if tried else
+             f"0 packets to {server} on {wan}, though the relay made no attempt "
+             f"in the window") if not dialled
+            else f"LEAKED - {len(dialled)} packet(s) to {server} on {wan}: "
+                 f"{dialled[:2]}")
+        report.add(
+            "disrupt_blackhole",
+            f"routing table {entry.table} fell back to blackhole",
+            blackholed,
+            "only the blackhole default remains" if blackholed
+            else "a real default route was still present - the kernel-level "
+                 "failsafe is NOT in effect")
+        log.info("%s and %s restored", t.slug, entry.slug)
 
     def _check_disrupted(self, report: Report, egress_kind: EgressKind,
                          egress_slug: str, wan: str) -> None:

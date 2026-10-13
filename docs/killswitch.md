@@ -192,6 +192,43 @@ rather than resolving over the uplink.
 
 ---
 
+## Proxy exits
+
+A SOCKS5 or HTTP proxy can be an exit (see
+[operations.md](operations.md#proxies)). Every layer above applies to it
+unchanged: to the host, a proxy exit is a tunnel whose interface is
+`px-<slug>`, one end of a veth pair into a network namespace of its own. What
+is new is a third way to fail. A tunnel either carries a packet or blackholes
+it; a proxy exit can also be **gone around** - traffic leaving through the
+entry tunnel without passing the proxy. That is no leak to the ISP, but it
+shows the destination the entry tunnel's address instead of the proxy's, the
+one thing the proxy was chosen to change.
+
+**The relay is not on the host.** redsocks runs inside the namespace, whose
+only interfaces are `lo` and the veth, and whose own ruleset admits nothing but
+connections to the relay and lets nothing out but TCP to the proxy server. A
+client's connection and the relay's connection to its server both cross the
+host's forward chain, so a maintenance window - which opens only the host's own
+output - cannot reach a proxied byte. The host does not take the namespace's
+word for any of it:
+
+* `px_upstream` lets a proxy interface reach one address and port, through a
+  tunnel interface, and nothing else; `proxy_upstream_drop` counts the rest.
+* `px_entry` gives the relay's traffic its entry tunnel's mark, so it is routed
+  by the entry's table - and, when the entry is down, by its blackhole. The
+  proxy server never appears on the uplink, and forward rule 2,
+  `oifname $WAN drop`, would stop it if it tried.
+* Client UDP to a proxy exit is refused with an ICMP error
+  (`proxy_nontcp_drop`), so QUIC falls back to TCP at once. None of it is sent
+  around the proxy.
+* DNS is asked over UDP into the namespace, where `pxdns` turns it into TCP
+  through the relay: lookups leave where the traffic leaves.
+
+There is no way to dial a proxy directly. The model refuses a proxy without an
+entry, the API refuses to unchain one, and the panel offers no such choice:
+dialled directly, the proxy's provider would see this gateway's real address,
+and the login would cross the ISP's wire in the clear.
+
 ## Proving it
 
 ```bash
@@ -216,6 +253,29 @@ If they ever disagree, believe tcpdump.
 that tunnel lose connectivity for roughly twenty seconds. Without the flag the
 destructive checks are skipped and the report says so.
 
+With a proxy as the test's exit (`vpngwctl selftest --egress tunnel:<slug>`, or
+**Through** on the panel's Security page), four checks are added. Each is
+watched at three points - the uplink, inside the entry tunnel, and on the veth
+into the proxy's namespace:
+
+| Check | Fails when |
+|---|---|
+| the exit is the proxy's | the client exits with the entry tunnel's own address |
+| the proxy is dialled only through its entry | a packet to the proxy server appears on the uplink |
+| client UDP is refused | the canary appears anywhere, or `proxy_nontcp_drop` does not move |
+| DNS goes through the proxy | a lookup's name appears as plain DNS on the uplink or inside the entry |
+
+A capture that saw nothing at all - not even the traffic it was there to see -
+is reported as a warning, not a pass: it proves nothing either way.
+
+`--disrupt` on a proxy exit tests its own two failures. Its relay is stopped,
+and nothing may reach the internet through the entry tunnel instead. Then its
+entry tunnel is taken down, and the relay must not reach for the proxy server
+over the uplink. The proxy's route is kept in place for both, so what refuses
+the client is the namespace and the relay, not the routing blackhole the other
+checks already cover. Clients on the entry and on the proxy lose connectivity
+for roughly half a minute.
+
 ## Reading the counters
 
 ```bash
@@ -230,6 +290,9 @@ nft list counters table inet vpngw
 | `forwarded_new` | new client flows admitted into a tunnel |
 | `dns_hijacked` | client DNS queries redirected |
 | `host_egress_drop` | the gateway's own traffic, blocked by strict egress |
+| `proxy_nontcp_drop` | client UDP refused on a proxy exit, which carries TCP only |
+| `proxy_upstream_drop` | a proxy's relay sending anywhere but its one server — **should stay at zero** |
+| `proxy_upstream_new` | new connections from relays to their proxy servers |
 
 A rising `wan_leak_drop` is **not** a leak. It is the record of attempts that
 were stopped — usually a client retrying while its tunnel reconnects. A leak

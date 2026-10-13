@@ -470,6 +470,23 @@ class TheUnits(unittest.TestCase):
         self.assertIn("%d/redsocks.conf", exec_line)
         self.assertNotIn("password", exec_line.lower())
 
+    def test_the_resolver_comes_back_with_the_relay(self):
+        """BindsTo stops pxdns with the relay; nothing started it again when
+        Restart= brought the relay back. Found live: relay up, DNS dead."""
+        self.assertIn("BindsTo=vpngw-proxy@%i.service\n", self.unit("vpngw-pxdns@.service"))
+        self.assertIn("Upholds=vpngw-pxdns@%i.service\n", self.unit("vpngw-proxy@.service"))
+
+    def test_a_dead_resolver_makes_the_proxy_unhealthy(self):
+        """The probe asks for an address, so only the hint can see it."""
+        from vpngw.tunnels import proxy
+        self.addCleanup(setattr, proxy, "try_run", proxy.try_run)
+        self.addCleanup(setattr, proxy, "link_exists", proxy.link_exists)
+        proxy.link_exists = lambda iface: True
+        proxy.try_run = lambda argv, **kw: type("R", (), {"ok": "vpngw-pxdns@" not in argv[-1]})()
+        verdict, reason = proxy.ProxyDriver().healthy_hint(px("res-de1", 7))
+        self.assertIs(verdict, False)
+        self.assertIn("resolver", reason)
+
     def test_neither_unit_starts_by_itself(self):
         for name in ("vpngw-proxy@.service", "vpngw-pxdns@.service"):
             with self.subTest(name=name):
@@ -1029,6 +1046,154 @@ class ThePanel(unittest.TestCase):
         self.assertIn('label: "Proxies"', self.fn("egressOptions"))
         # ...and never with a way to dial it directly.
         self.assertNotIn('value: ""', self.fn("entryOption"))
+
+class TheProxySelfTest(unittest.TestCase):
+    """The self-test's proxy checks, fed what tcpdump would print.
+
+    Each scenario is the capture a real fault would produce; the check must
+    name it, and an inconclusive capture must warn rather than cry wolf.
+    """
+
+    SERVER = "192.0.2.44"
+
+    def run_checks(self, scenario, *, exit_ip="198.51.100.77", entry_exit="43.229.76.126",
+                   refused=3, answered=True):
+        from types import SimpleNamespace
+        from vpngw import leaktest
+
+        t = px("res-de1", 7, via="vpn1", host="gate.example.net", port=7000)
+        t.endpoints = [self.SERVER]
+        entry = wg("vpn1", 1)
+        seen_label = {}
+
+        class FakeWatch:
+            def __init__(fw, iface, bpf, needles, *, payload=False, count=2000):
+                fw.iface, fw.bpf, fw.needles, fw.payload = iface, bpf, needles, payload
+                if payload:
+                    seen_label["label"] = needles[0]
+
+            def __enter__(fw):
+                return fw
+
+            def __exit__(fw, *exc):
+                return None
+
+            def captured(fw):
+                lines = scenario(fw.iface, fw.payload, seen_label.get("label", ""))
+                return [l for l in lines if any(n in l for n in fw.needles)]
+
+        counters = iter([{"proxy_nontcp_drop": {"packets": 10}},
+                         {"proxy_nontcp_drop": {"packets": 10 + refused}}])
+        self.addCleanup(setattr, leaktest.nft, "counters", leaktest.nft.counters)
+        leaktest.nft.counters = lambda: next(counters)
+        self.addCleanup(setattr, leaktest.LeakTest, "_Watch", leaktest.LeakTest._Watch)
+        leaktest.LeakTest._Watch = FakeWatch
+
+        test = object.__new__(leaktest.LeakTest)
+        test.settings = SimpleNamespace(
+            net=SimpleNamespace(wan_iface="eth0"),
+            dns=SimpleNamespace(resolver_ip=lambda esid: "10.99.0.9"))
+        test.db = SimpleNamespace(tunnel=lambda slug: entry if slug == "vpn1" else t)
+        health = SimpleNamespace(get=lambda slug: SimpleNamespace(exit_ip=entry_exit))
+        test.service = SimpleNamespace(reconciler=SimpleNamespace(health=health))
+        test._reaches_internet = lambda timeout=8: exit_ip
+        test._canary = lambda count=5: None
+        test._ns = lambda *argv, timeout=20: SimpleNamespace(
+            ok=answered, stdout=";; ->>HEADER<<- opcode: QUERY, status: NXDOMAIN"
+            if answered else "")
+        report = leaktest.Report()
+        test._check_proxy(report, t, exit_ip)
+        return {c.id: c for c in report.checks}
+
+    def clean(self, iface, payload, label):
+        if iface == "wg-vpn1":
+            return [f"12:00:00.000000 IP 10.64.0.2.40000 > {self.SERVER}.7000: Flags [S], seq 1"]
+        if iface == "px-res-de1" and payload:
+            return [f"E..<..@.@....{label}.example.com....."]
+        return []
+
+    def test_a_sound_proxy_passes_all_four(self):
+        checks = self.run_checks(self.clean)
+        for cid in ("proxy_exit_not_entry", "proxy_server_via_entry",
+                    "proxy_udp_refused", "proxy_dns_through_proxy"):
+            with self.subTest(check=cid):
+                self.assertTrue(checks[cid].passed, checks[cid].detail)
+        self.assertIn("over TCP", checks["proxy_dns_through_proxy"].detail)
+
+    def test_the_proxy_dialled_over_the_uplink_is_critical(self):
+        def scenario(iface, payload, label):
+            if iface == "eth0":
+                return [f"12:00:00.000000 IP 100.200.50.100.40000 > {self.SERVER}.7000: Flags [S]"]
+            return self.clean(iface, payload, label)
+        c = self.run_checks(scenario)["proxy_server_via_entry"]
+        self.assertEqual((c.passed, c.critical), (False, True))
+        self.assertIn("LEAKED", c.detail)
+
+    def test_udp_inside_the_entry_is_critical(self):
+        def scenario(iface, payload, label):
+            extra = (["12:00:00.000000 IP 10.64.0.2.5000 > 203.0.113.9.51999: UDP, length 13"]
+                     if iface == "wg-vpn1" else [])
+            return self.clean(iface, payload, label) + extra
+        c = self.run_checks(scenario)["proxy_udp_refused"]
+        self.assertEqual((c.passed, c.critical), (False, True))
+
+    def test_udp_into_the_namespace_is_critical(self):
+        def scenario(iface, payload, label):
+            extra = (["12:00:00.000000 IP 10.10.0.250.5000 > 203.0.113.9.51999: UDP, length 13"]
+                     if iface == "px-res-de1" and not payload else [])
+            return self.clean(iface, payload, label) + extra
+        c = self.run_checks(scenario)["proxy_udp_refused"]
+        self.assertEqual((c.passed, c.critical), (False, True))
+
+    def test_dns_around_the_proxy_is_critical(self):
+        def scenario(iface, payload, label):
+            extra = ([f"12:00:00.000000 IP 10.64.0.2.5353 > 10.64.0.1.53: 1+ A? {label}.example.com. (40)"]
+                     if iface == "wg-vpn1" else [])
+            return self.clean(iface, payload, label) + extra
+        c = self.run_checks(scenario)["proxy_dns_through_proxy"]
+        self.assertEqual((c.passed, c.critical), (False, True))
+
+    def test_the_resolver_talking_to_pxdns_is_not_a_leak(self):
+        """dnsmasq asks over UDP into the namespace, where pxdns turns it
+        into TCP through the relay. That UDP leg is the design."""
+        def scenario(iface, payload, label):
+            extra = ([f"12:00:00.000000 IP 10.99.0.7.4321 > 1.1.1.1.53: 1+ A? {label}.example.com. (40)"]
+                     if iface == "px-res-de1" and not payload else [])
+            return self.clean(iface, payload, label) + extra
+        checks = self.run_checks(scenario)
+        self.assertTrue(checks["proxy_dns_through_proxy"].passed)
+        self.assertTrue(checks["proxy_udp_refused"].passed)
+
+    def test_the_client_exiting_as_the_entry_is_critical(self):
+        c = self.run_checks(self.clean, exit_ip="43.229.76.126")["proxy_exit_not_entry"]
+        self.assertEqual((c.passed, c.critical), (False, True))
+        self.assertIn("AROUND THE PROXY", c.detail)
+
+    def test_a_capture_that_saw_nothing_warns_rather_than_fails(self):
+        checks = self.run_checks(lambda iface, payload, label: [], refused=0)
+        for cid in ("proxy_server_via_entry", "proxy_udp_refused"):
+            with self.subTest(check=cid):
+                self.assertEqual((checks[cid].passed, checks[cid].critical), (False, False))
+
+    def test_no_answer_proves_nothing_about_dns(self):
+        c = self.run_checks(self.clean, answered=False)["proxy_dns_through_proxy"]
+        self.assertEqual((c.passed, c.critical), (False, False))
+
+
+class TheProxyDisruption(unittest.TestCase):
+    """Held tunnels lose their routes; the proxy's must be put back, or the
+    relay-stopped and entry-down phases only re-test the blackhole."""
+
+    def test_the_route_into_the_namespace_is_restored_inside_each_hold(self):
+        src = (Path(__file__).resolve().parent.parent / "vpngw/leaktest.py"
+               ).read_text(encoding="utf-8")
+        body = src[src.index("def _check_disrupted_proxy("):src.index("def _check_disrupted(")]
+        holds = body.split("with self.service.reconciler.hold(")[1:]
+        self.assertEqual(len(holds), 2)
+        for phase in holds:
+            with self.subTest(phase=phase.splitlines()[0]):
+                self.assertLess(phase.index("routing.set_default_via(*into_namespace)"),
+                                phase.index("self._reaches_internet("))
 
 if __name__ == "__main__":
     unittest.main()

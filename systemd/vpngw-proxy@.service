@@ -7,6 +7,11 @@ After=vpngw-killswitch.service
 # on its own would be one the daemon had not sealed.
 ConditionPathExists=/run/vpngw/proxy/%i/redsocks.conf
 ConditionPathExists=/run/netns/vpngw-px-%i
+# The resolver is bound to the relay and stops with it - including when the
+# relay crashes and Restart= brings it back, after which nothing restarted the
+# resolver: found on the reference gateway, a relay up and its clients' DNS
+# dead. Upholds starts it again whenever the relay is up and it is not.
+Upholds=vpngw-pxdns@%i.service
 
 # Intentionally NOT PartOf=vpngw.service, for the same reason as the OpenVPN
 # units: restarting the control plane must not drop working connections. If
