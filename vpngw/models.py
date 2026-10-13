@@ -325,6 +325,9 @@ class TunnelHealth:
     rtt_ms: float | None = None
     last_change: float = 0.0
     last_probe: float = 0.0
+    # When a probe last produced a measurement. Differs from last_probe for a
+    # driver that measures less often than the reconcile loop runs.
+    last_sample: float = 0.0
     up_since: float | None = None
     exit_ip: str | None = None
     exit_ip_checked: float = 0.0

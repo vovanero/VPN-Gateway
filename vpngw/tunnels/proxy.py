@@ -201,6 +201,9 @@ def render_pxdns(upstreams: list[str]) -> str:
 
 class ProxyDriver(TunnelDriver):
     kind = TunnelKind.PROXY
+    #: Seconds between HTTP probes once the egress is UP. Each costs a TLS
+    #: handshake through a proxy that is often billed by the byte.
+    probe_interval = 30
 
     @staticmethod
     def _runtime(t: Tunnel) -> Path:

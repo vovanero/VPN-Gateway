@@ -24,7 +24,7 @@ import re
 import time
 
 from .config import HealthSettings
-from .models import HealthState, Tunnel, TunnelHealth
+from .models import TunnelKind, HealthState, Tunnel, TunnelHealth
 from .net.shell import try_run
 from .tunnels import driver_for
 
@@ -117,16 +117,38 @@ class HealthMonitor:
             h.rtt_ms = None
             return self._settle(h, False, reason)
 
-        ok, rtt = ping_via(t.iface, self.s.probe_target, self.s.probe_timeout)
-        if ok:
-            h.rtt_ms = rtt
+        # A driver can measure less often than the loop runs. Proxy egress
+        # does: its probe is a real HTTP request through the proxy, and
+        # residential proxies are usually paid for by the byte. Once UP it is
+        # re-measured every probe_interval seconds; until then, every pass, so
+        # a new proxy comes up promptly. The hint above runs every pass
+        # regardless, so a dead relay is still noticed at once.
+        interval = getattr(driver, "probe_interval", 0)
+        if (interval and h.state is HealthState.UP
+                and now - h.last_sample < interval):
+            return h
+        probe = getattr(driver, "probe", None)
+        if probe is not None:
+            ok, rtt, exit_ip = probe(t)
         else:
-            h.rtt_ms = None
+            ok, rtt = ping_via(t.iface, self.s.probe_target, self.s.probe_timeout)
+            exit_ip = None
+        h.last_sample = now
+        h.rtt_ms = rtt if ok else None
+        if ok and exit_ip:
+            if exit_ip != h.exit_ip:
+                log.info("%s exit address is now %s", t.slug, exit_ip)
+            h.exit_ip = exit_ip
+            h.exit_ip_checked = now
         return self._settle(h, ok, "" if ok else "probe timed out")
 
     def refresh_exit_ip(self, t: Tunnel) -> None:
         h = self.get(t.slug)
         if h.state is not HealthState.UP:
+            return
+        if t.kind is TunnelKind.PROXY:
+            # Its probe already reports the exit, measured through the relay;
+            # curl --interface cannot route on a veth with no default route.
             return
         if time.time() - h.exit_ip_checked < self.s.exitip_interval:
             return

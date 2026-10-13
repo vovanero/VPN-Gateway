@@ -122,6 +122,10 @@ try:
         # moment it is configured, handshake or not. Testing only that picked
         # a tunnel that had never handshaken because it came first in the
         # list, and the update failed with "could not reach GitHub".
+        # Never a proxy: curl --interface cannot route on its veth, and a
+        # release is no reason to spend a metered residential proxy's bytes.
+        if t.kind.value == "proxy":
+            continue
         if ifaces.exists(t.iface) and routing.table_default(t.table) == t.iface:
             print(t.iface, t.slug, settings.dns.resolver_ip(t.esid))
             break

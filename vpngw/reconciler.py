@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import logging
 import time
 from contextlib import contextmanager
@@ -244,8 +245,13 @@ class Reconciler:
         for eg in egresses:
             routing.ensure_blackhole(eg.table)
         by_slug = {t.slug: t for t in tunnels if t.enabled}
+        # A proxy is chained, but has no outer rule: what its relay sends is
+        # marked with its entry's own selector by the firewall (px_entry), so
+        # the entry's ordinary rule already routes it. An outer rule would
+        # also compete for the single priority-850 slot.
         chained = [(t, by_slug[t.via]) for t in by_slug.values()
-                   if t.via and t.via in by_slug]
+                   if t.via and t.via in by_slug
+                   and t.kind is not TunnelKind.PROXY]
         routing.sync_rules(
             routing.desired_rules(egresses, self.settings.dns.resolver_ip,
                                   chained)
@@ -333,9 +339,12 @@ class Reconciler:
         tunnels = sorted(tunnels, key=depth)
         expected: set[str] = set()
         for t in tunnels:
-            if t.via and not t.mtu:
+            if t.via and not t.mtu and t.kind is not TunnelKind.PROXY:
                 # In-memory only: mtu=0 stays on disk meaning "derive it",
-                # so re-parenting the chain re-derives automatically.
+                # so re-parenting the chain re-derives automatically. Not for
+                # a proxy: its veth carries plaintext that the relay re-sends,
+                # and one end at a lower MTU than the other drops full-size
+                # frames outright.
                 t.mtu = self._chain_mtu(t, by_slug)
             driver = driver_for(t)
             if t.slug in self._held:
@@ -353,7 +362,8 @@ class Reconciler:
                     except Exception as exc:
                         log.error("cannot bring up %s: %s", t.slug, exc)
                         self.db.log_event("error", t.slug, f"up failed: {exc}")
-                elif ifaces.mtu_of(t.iface) not in (0, t.mtu or None) and t.mtu:
+                elif (t.kind is not TunnelKind.PROXY and t.mtu
+                      and ifaces.mtu_of(t.iface) not in (0, t.mtu or None)):
                     # An MTU edit alone must not wait for the next re-up: on a
                     # chain it is the difference between working and "DNS fine,
                     # HTTPS hangs". Setting it live costs no handshake.
@@ -381,6 +391,33 @@ class Reconciler:
                     self.health.forget(t.slug)
                     self.db.log_event("info", t.slug, "tunnel disabled")
         ifaces.remove_orphans(expected)
+        self._remove_orphan_namespaces(
+            {t.netns for t in tunnels if t.kind is TunnelKind.PROXY and t.enabled})
+
+    @staticmethod
+    def _remove_orphan_namespaces(expected: set[str]) -> None:
+        """Namespaces, units and runtime files of proxies that no longer exist.
+
+        Deleting px-<slug> takes its peer with it, but the namespace, the
+        relay unit and its config would outlive the egress - a relay holding a
+        login for a proxy the operator has removed.
+        """
+        from .tunnels.proxy import DNS_UNIT, RELAY_UNIT
+        import shutil
+
+        try:
+            names = os.listdir("/run/netns")
+        except OSError:
+            return
+        for name in names:
+            if not name.startswith(config.NETNS_PREFIX) or name in expected:
+                continue
+            slug = name[len(config.NETNS_PREFIX):]
+            try_run(["systemctl", "stop", DNS_UNIT.format(slug=slug),
+                     RELAY_UNIT.format(slug=slug)])
+            try_run(["ip", "netns", "del", name])
+            shutil.rmtree(config.PROXY_RUNTIME / slug, ignore_errors=True)
+            log.info("removed orphaned proxy namespace %s", name)
 
     # -- 4. health ----------------------------------------------------------
 

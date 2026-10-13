@@ -492,5 +492,126 @@ class TheUnits(unittest.TestCase):
         self.assertIn('VPNGW_FETCH_IFACE="$TUN_IFACE"', script)
 
 
+class TheHealthProbe(unittest.TestCase):
+    """ICMP does not cross a proxy, so its health is an HTTP request through
+    the relay - measured at the driver's cadence, never more often."""
+
+    def setUp(self):
+        from vpngw.health import HealthMonitor
+        from vpngw.tunnels import proxy
+        self.mon = HealthMonitor(config.HealthSettings())
+        self.t = px("res-de1", 7)
+        self.calls = []
+        self.reply = (True, 612.0, "203.0.113.50")
+
+        def fake_probe(_self, t):
+            self.calls.append(t.slug)
+            return self.reply
+
+        self.addCleanup(setattr, proxy.ProxyDriver, "probe", proxy.ProxyDriver.probe)
+        self.addCleanup(setattr, proxy.ProxyDriver, "healthy_hint",
+                        proxy.ProxyDriver.healthy_hint)
+        proxy.ProxyDriver.probe = fake_probe
+        proxy.ProxyDriver.healthy_hint = lambda _self, t: (None, "")
+
+    def test_the_probe_reports_the_exit_and_the_latency(self):
+        h = self.mon.probe(self.t)
+        self.assertEqual(h.exit_ip, "203.0.113.50")
+        self.assertEqual(h.rtt_ms, 612.0)
+
+    def test_it_comes_up_without_waiting_for_the_slow_cadence(self):
+        from vpngw.models import HealthState
+        for _ in range(self.mon.s.rise_threshold):
+            h = self.mon.probe(self.t)
+        self.assertIs(h.state, HealthState.UP)
+        self.assertEqual(len(self.calls), self.mon.s.rise_threshold)
+
+    def test_once_up_it_is_not_re_measured_every_pass(self):
+        """Every probe is billed bytes through a residential proxy."""
+        for _ in range(self.mon.s.rise_threshold):
+            self.mon.probe(self.t)
+        before = len(self.calls)
+        for _ in range(5):
+            self.mon.probe(self.t)
+        self.assertEqual(len(self.calls), before)
+
+    def test_a_dead_relay_is_noticed_between_measurements(self):
+        """The hint runs every pass, so the slow cadence never hides a crash."""
+        from vpngw.models import HealthState
+        from vpngw.tunnels import proxy
+        for _ in range(self.mon.s.rise_threshold):
+            self.mon.probe(self.t)
+        proxy.ProxyDriver.healthy_hint = lambda _self, t: (False, "relay not running")
+        for _ in range(self.mon.s.fail_threshold):
+            h = self.mon.probe(self.t)
+        self.assertIs(h.state, HealthState.DOWN)
+
+    def test_the_exit_is_not_fetched_a_second_way(self):
+        from vpngw import health
+        called = []
+        self.addCleanup(setattr, health, "exit_ip_via", health.exit_ip_via)
+        health.exit_ip_via = lambda *a, **k: called.append(a)
+        for _ in range(self.mon.s.rise_threshold):
+            self.mon.probe(self.t)
+        self.mon.refresh_exit_ip(self.t)
+        self.assertEqual(called, [])
+
+
+class TheReconciler(unittest.TestCase):
+
+    def test_a_proxy_gets_no_outer_rule(self):
+        """Its relay's traffic is steered by px_entry into the entry's own
+        rule; an outer rule would also take the single priority-850 slot."""
+        from types import SimpleNamespace
+        from vpngw import reconciler
+        from vpngw.models import Egress
+        seen = {}
+        self.addCleanup(setattr, reconciler.routing, "sync_rules",
+                        reconciler.routing.sync_rules)
+        self.addCleanup(setattr, reconciler.routing, "ensure_blackhole",
+                        reconciler.routing.ensure_blackhole)
+        reconciler.routing.sync_rules = lambda rules: seen.setdefault("rules", rules)
+        reconciler.routing.ensure_blackhole = lambda table: None
+        nl, p = wg("nl01", 1, ["198.51.100.7"]), px("res-de1", 7)
+        fake = SimpleNamespace(settings=config.Settings())
+        reconciler.Reconciler._step_routes(fake, [Egress.of(nl), Egress.of(p)], [nl, p])
+        priorities = {int(r[r.index("priority") + 1]) for r in seen["rules"]}
+        self.assertNotIn(config.RULE_PRIO_OUTER, priorities)
+        # ...while an ordinary chained tunnel still gets one, so this is not
+        # passing merely because nothing ever produces an outer rule.
+        seen.clear()
+        rider = wg("ch01", 3, ["192.0.2.88"], via="nl01")
+        reconciler.Reconciler._step_routes(fake, [Egress.of(nl), Egress.of(rider)],
+                                           [nl, rider])
+        priorities = {int(r[r.index("priority") + 1]) for r in seen["rules"]}
+        self.assertIn(config.RULE_PRIO_OUTER, priorities)
+
+    def test_orphaned_namespaces_are_cleared_with_their_units(self):
+        from vpngw import reconciler
+        stopped = []
+        self.addCleanup(setattr, reconciler.os, "listdir", reconciler.os.listdir)
+        self.addCleanup(setattr, reconciler, "try_run", reconciler.try_run)
+        reconciler.os.listdir = lambda path: ["vpngw-px-old01", "vpngw-px-res-de1",
+                                              "vpngw-test", "unrelated"]
+        reconciler.try_run = lambda argv, **kw: stopped.append(argv)
+        reconciler.Reconciler._remove_orphan_namespaces({"vpngw-px-res-de1"})
+        flat = [" ".join(a) for a in stopped]
+        self.assertTrue(any("vpngw-proxy@old01.service" in a for a in flat))
+        self.assertIn("ip netns del vpngw-px-old01", flat)
+        self.assertFalse(any("res-de1" in a for a in flat), "removed a live proxy")
+        self.assertFalse(any("vpngw-test" in a for a in flat),
+                         "removed the self-test's namespace")
+
+    def test_no_chain_mtu_is_forced_onto_a_veth(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "vpngw/reconciler.py").read_text(encoding="utf-8")
+        self.assertIn("if t.via and not t.mtu and t.kind is not TunnelKind.PROXY:", src)
+
+    def test_the_updater_never_fetches_through_a_proxy(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "scripts/update.sh").read_text(encoding="utf-8")
+        self.assertIn('if t.kind.value == "proxy":', src)
+
+
 if __name__ == "__main__":
     unittest.main()
