@@ -661,7 +661,7 @@ class TheReconciler(unittest.TestCase):
     def test_the_updater_never_fetches_through_a_proxy(self):
         src = (Path(__file__).resolve().parent.parent
                / "scripts/update.sh").read_text(encoding="utf-8")
-        self.assertIn('if t.kind.value == "proxy":', src)
+        self.assertIn('return (t.kind.value != "proxy" and ifaces.exists(t.iface)', src)
 
 
 class TheDiagnosis(unittest.TestCase):
@@ -1221,11 +1221,21 @@ class RedsocksArrivesWithTheUpdate(unittest.TestCase):
         self.assertIn('-n "${VPNGW_FETCH_IFACE:-}"', first)
         self.assertIn("return 0", first)
 
+    def test_installed_means_installed(self):
+        """dpkg -s succeeds for a package removed with its config kept."""
+        for rel in ("install.sh", "scripts/update.sh"):
+            with self.subTest(rel=rel):
+                code = [l for l in self.src(rel).splitlines()
+                        if not l.lstrip().startswith("#")]
+                self.assertFalse([l for l in code if "dpkg -s " in l])
+                self.assertTrue([l for l in code if "install ok installed" in l])
+
     def test_up_to_date_without_redsocks_is_not_up_to_date(self):
         script = self.src("scripts/update.sh")
         branch = script[script.index('if [[ "v$CURRENT" == "$LATEST"'):]
         branch = branch[:branch.index("\nfi\n")]
-        self.assertLess(branch.index("dpkg -s redsocks"), branch.index('ok "already up to date"'))
+        self.assertLess(branch.index("dpkg-query -W -f='${Status}' redsocks"),
+                        branch.index('ok "already up to date"'))
 
 if __name__ == "__main__":
     unittest.main()

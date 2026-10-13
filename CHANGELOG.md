@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.8.2 - the updater picks a tunnel the daemon has seen working
+
+- Right after the daemon starts, every enabled tunnel is routed until its
+  first probes are in, dead ones included. Run straight after a restart -
+  after another update, say - `vpngw-update` picked a dead tunnel that came
+  first in the list and stopped with "could not reach GitHub through fi02",
+  a working tunnel beside it. It now asks the daemon which tunnels it has
+  measured as up, waiting up to 30 seconds for the first measurements; with
+  no daemon to ask, routed is still the test. The installer picks the same
+  way.
+- Installed now means installed. A package removed with its configuration
+  kept still passed `dpkg -s`, so the installer would skip it for good - and
+  2.8.1's redsocks repair could be fooled the same way.
+
 ## 2.8.1 - updating from 2.7.1 brings redsocks too
 
 Updating a gateway from 2.7.1 to 2.8.0 left proxy exits unavailable: "redsocks

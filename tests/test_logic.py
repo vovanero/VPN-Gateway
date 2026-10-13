@@ -934,7 +934,22 @@ class EveryTunnelPickerWantsARoutedTunnel(unittest.TestCase):
         src = (self.ROOT / "install.sh").read_text(encoding="utf-8")
         picker = src[src.index("pick_fetch_tunnel() {"):src.index("install_missing() {")]
         self.assertIn(self.ROUTED, picker)
-        self.assertIn('t.kind.value == "proxy"', picker)
+        self.assertIn('t.kind.value != "proxy"', picker)
+
+    def test_routed_is_not_enough_when_the_daemon_can_say_more(self):
+        """Right after the daemon starts, every tunnel is routed until its
+        first probes are in - a dead one included. Both pickers ask the
+        daemon which tunnels it has measured up, and fall back to routed
+        only when there is no daemon to ask."""
+        for rel, start, end in (("scripts/update.sh", "read -r TUN_IFACE", ')" || true'),
+                                ("install.sh", "pick_fetch_tunnel() {", "install_missing() {")):
+            with self.subTest(rel=rel):
+                src = (self.ROOT / rel).read_text(encoding="utf-8")
+                picker = src[src.index(start):src.index(end, src.index(start))]
+                self.assertIn('t.get("state") == "up"', picker)
+                self.assertIn("except (Exception, SystemExit):", picker)
+                self.assertLess(picker.index("up = measured_up()"),
+                                picker.index("candidates[0] if candidates"))
 
     def test_the_readme_bootstrap(self):
         src = (self.ROOT / "README.md").read_text(encoding="utf-8")

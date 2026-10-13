@@ -107,28 +107,59 @@ say "choosing a tunnel to fetch through"
 
 read -r TUN_IFACE TUN_SLUG RESOLVER <<<"$(
     PYTHONPATH="$PREFIX" python3 - <<'PY'
-import sys
+import time
+
 from vpngw import config
 from vpngw.db import Database
 from vpngw.net import ifaces, routing
 
 settings = config.Settings.load()
+
+
+def routed(t):
+    # Up means the interface exists AND the kernel has a real default route
+    # in its table pointing at it - the panel's "routed" test. The interface
+    # alone is not enough: a WireGuard device exists from the moment it is
+    # configured, handshake or not. Never a proxy: curl --interface cannot
+    # route on its veth, and a release is no reason to spend a metered
+    # residential proxy's bytes.
+    return (t.kind.value != "proxy" and ifaces.exists(t.iface)
+            and routing.table_default(t.table) == t.iface)
+
+
+def measured_up():
+    """The tunnels the daemon has measured as up; None if it cannot say.
+
+    Routed alone is not enough right after the daemon starts: until its
+    first probes are in, a tunnel is routed whatever its state, and a dead
+    one first in the list was picked - "could not reach GitHub through
+    fi02", on a gateway with a working tunnel beside it.
+    """
+    try:
+        from vpngw.cli import Daemon
+        status = Daemon(settings).call("/api/status", timeout=5)
+    except (Exception, SystemExit):
+        return None
+    return {t["slug"] for t in status.get("tunnels", []) if t.get("state") == "up"}
+
+
 db = Database()
 try:
-    for t in db.tunnels(enabled_only=True):
-        # Up means the interface exists AND the kernel has a real default
-        # route in its table pointing at it - the panel's "routed" test. The
-        # interface alone is not enough: a WireGuard device exists from the
-        # moment it is configured, handshake or not. Testing only that picked
-        # a tunnel that had never handshaken because it came first in the
-        # list, and the update failed with "could not reach GitHub".
-        # Never a proxy: curl --interface cannot route on its veth, and a
-        # release is no reason to spend a metered residential proxy's bytes.
-        if t.kind.value == "proxy":
-            continue
-        if ifaces.exists(t.iface) and routing.table_default(t.table) == t.iface:
-            print(t.iface, t.slug, settings.dns.resolver_ip(t.esid))
+    pick, deadline = None, time.time() + 30
+    while pick is None:
+        candidates = [t for t in db.tunnels(enabled_only=True) if routed(t)]
+        up = measured_up()
+        if up is None:
+            # No daemon to ask: routed is the best evidence there is.
+            pick = candidates[0] if candidates else None
             break
+        pick = next((t for t in candidates if t.slug in up), None)
+        if pick is None:
+            if time.time() > deadline:
+                break
+            time.sleep(2)
+    if pick:
+        print(pick.iface, pick.slug, settings.dns.resolver_ip(pick.esid))
     else:
         print("", "", "")
 finally:
@@ -203,7 +234,8 @@ if [[ "v$CURRENT" == "$LATEST" || "$CURRENT" == "$LATEST" ]] && [[ -z "$WANT_TAG
     # installer without a tunnel to fetch through, so proxy exits stayed
     # unavailable with nothing left to update to. Installing the same release
     # again fetches it now, by the same safe path as any update.
-    if dpkg -s redsocks >/dev/null 2>&1; then
+    # Not `dpkg -s`: it succeeds for a removed package that kept its config.
+    if dpkg-query -W -f='${Status}' redsocks 2>/dev/null | grep -q "install ok installed"; then
         ok "already up to date"
         exit 0
     fi
