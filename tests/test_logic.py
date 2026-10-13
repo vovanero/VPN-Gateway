@@ -881,5 +881,30 @@ class StylesheetTokensExist(unittest.TestCase):
                          "these tokens are used but never defined")
 
 
+class EveryTunnelPickerWantsARoutedTunnel(unittest.TestCase):
+    """Anything that picks "a tunnel to use" must pick one that is routed.
+
+    An interface existing proves nothing: a WireGuard device exists from the
+    moment it is configured, handshake or not. Picking by that, in list order,
+    chose a tunnel that had never handshaken - first in the self-test, which
+    then reported a critical failure on a sound gateway, and again in the
+    updater, which refused to update with "could not reach GitHub through
+    fi02". Same bug, two places; this keeps it out of the third.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    ROUTED = "routing.table_default(t.table) == t.iface"
+
+    def test_the_updater(self):
+        src = (self.ROOT / "scripts/update.sh").read_text(encoding="utf-8")
+        self.assertIn(self.ROUTED, src)
+
+    def test_the_readme_bootstrap(self):
+        src = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        boot = src[src.index("read -r IF NS"):]
+        boot = boot[:boot.index("chmod 0755")]
+        self.assertIn(self.ROUTED, boot)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

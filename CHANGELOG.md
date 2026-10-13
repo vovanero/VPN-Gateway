@@ -1,5 +1,19 @@
 # Changelog
 
+## 2.7.1 - the updater picks a tunnel that works
+
+`vpngw-update` chose the first enabled tunnel whose interface existed. A
+WireGuard device exists from the moment it is configured, handshake or not, so
+on a gateway whose first tunnel had never connected the update failed with
+"could not reach GitHub through fi02" - refusing safely, but refusing. The
+comment above the code already said the test was "interface exists and the
+table has a real default route"; the code only did the first half.
+
+It now requires the route, the same "routed" test the panel shows. The README
+bootstrap had the same flaw and the same fix. This is the bug fixed in the
+self-test in 2.6.x, found again in a second place - so a test now checks every
+place that picks a tunnel to use.
+
 ## 2.7.0 - three leaks closed before proxies arrive
 
 Found by a six-lens leak audit with independent verification, and by the

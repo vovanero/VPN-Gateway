@@ -412,12 +412,14 @@ script does for itself - find a tunnel that is up, resolve the name through
 ```bash
 read -r IF NS <<<"$(PYTHONPATH=/opt/vpngw python3 -c 'from vpngw import config
 from vpngw.db import Database
-from vpngw.net import ifaces
+from vpngw.net import ifaces, routing
 s = config.Settings.load()
 print(next((f"{t.iface} {s.dns.resolver_ip(t.esid)}"
             for t in Database().tunnels(enabled_only=True)
-            if ifaces.exists(t.iface)), ""))')"
-curl -sS --fail --interface "$IF" -o /usr/local/bin/vpngw-update   --resolve "raw.githubusercontent.com:443:$(dig +short raw.githubusercontent.com "@$NS" | grep -m1 -E '^[0-9.]+$')"   https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/scripts/update.sh
+            if routing.table_default(t.table) == t.iface), ""))')"
+curl -sS --fail --interface "$IF" -o /usr/local/bin/vpngw-update \
+  --resolve "raw.githubusercontent.com:443:$(dig +short raw.githubusercontent.com "@$NS" | grep -m1 -E '^[0-9.]+$')" \
+  https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/scripts/update.sh
 chmod 0755 /usr/local/bin/vpngw-update
 ```
 

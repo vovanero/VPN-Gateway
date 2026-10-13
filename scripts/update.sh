@@ -110,15 +110,19 @@ read -r TUN_IFACE TUN_SLUG RESOLVER <<<"$(
 import sys
 from vpngw import config
 from vpngw.db import Database
-from vpngw.net import ifaces
+from vpngw.net import ifaces, routing
 
 settings = config.Settings.load()
 db = Database()
 try:
     for t in db.tunnels(enabled_only=True):
-        # Up means the interface exists and the kernel has a real default
-        # route in its table - the same test the panel shows as "routed".
-        if ifaces.exists(t.iface):
+        # Up means the interface exists AND the kernel has a real default
+        # route in its table pointing at it - the panel's "routed" test. The
+        # interface alone is not enough: a WireGuard device exists from the
+        # moment it is configured, handshake or not. Testing only that picked
+        # a tunnel that had never handshaken because it came first in the
+        # list, and the update failed with "could not reach GitHub".
+        if ifaces.exists(t.iface) and routing.table_default(t.table) == t.iface:
             print(t.iface, t.slug, settings.dns.resolver_ip(t.esid))
             break
     else:
