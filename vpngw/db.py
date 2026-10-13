@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS tunnel (
     endpoint_hosts TEXT    NOT NULL DEFAULT '[]',
     via            TEXT    NOT NULL DEFAULT '',
     notes          TEXT    NOT NULL DEFAULT '',
+    proxy          TEXT    NOT NULL DEFAULT '{}',
     created_at     REAL    NOT NULL
 );
 
@@ -129,6 +130,9 @@ class Database:
             if "via" not in cols:
                 self._conn.execute(
                     "ALTER TABLE tunnel ADD COLUMN via TEXT NOT NULL DEFAULT ''")
+            if "proxy" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE tunnel ADD COLUMN proxy TEXT NOT NULL DEFAULT '{}'")
 
     def close(self) -> None:
         with self._lock:
@@ -168,6 +172,16 @@ class Database:
             log.warning("tunnel %s has kind %r, which this version does not "
                         "know; ignoring it", r["slug"], r["kind"])
             return None
+        try:
+            return self._build_tunnel(r, kind)
+        except ValidationError as exc:
+            # A row that no longer validates - a proxy written without its
+            # entry, say - is skipped for the same reason: one bad row must
+            # not stop the daemon, and skipping it fails closed.
+            log.warning("tunnel %s is invalid (%s); ignoring it", r["slug"], exc)
+            return None
+
+    def _build_tunnel(self, r: sqlite3.Row, kind: TunnelKind) -> Tunnel:
         return Tunnel(
             id=r["id"],
             slug=r["slug"],
@@ -182,6 +196,7 @@ class Database:
             endpoint_hosts=json.loads(r["endpoint_hosts"]),
             via=r["via"],
             notes=r["notes"],
+            proxy=json.loads(r["proxy"]) if "proxy" in r.keys() else {},
         )
 
     def tunnels(self, enabled_only: bool = False) -> list[Tunnel]:
@@ -206,13 +221,13 @@ class Database:
         )
         cur = self._x(
             "INSERT INTO tunnel (slug, name, kind, esid, enabled, config_path,"
-            " mtu, dns, endpoints, endpoint_hosts, via, notes, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " mtu, dns, endpoints, endpoint_hosts, via, notes, proxy,"
+            " created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 t.slug, t.name, t.kind.value, t.esid, int(t.enabled),
                 t.config_path, t.mtu, json.dumps(t.dns),
                 json.dumps(t.endpoints), json.dumps(t.endpoint_hosts),
-                t.via, t.notes, time.time(),
+                t.via, t.notes, json.dumps(t.proxy), time.time(),
             ),
         )
         t.id = cur.lastrowid
@@ -221,11 +236,12 @@ class Database:
     def update_tunnel(self, t: Tunnel) -> None:
         self._x(
             "UPDATE tunnel SET name=?, enabled=?, config_path=?, mtu=?, dns=?,"
-            " endpoints=?, endpoint_hosts=?, via=?, notes=? WHERE slug=?",
+            " endpoints=?, endpoint_hosts=?, via=?, notes=?, proxy=?"
+            " WHERE slug=?",
             (
                 t.name, int(t.enabled), t.config_path, t.mtu, json.dumps(t.dns),
                 json.dumps(t.endpoints), json.dumps(t.endpoint_hosts),
-                t.via, t.notes, t.slug,
+                t.via, t.notes, json.dumps(t.proxy), t.slug,
             ),
         )
 
@@ -285,17 +301,39 @@ class Database:
         the endpoint clash needs every other tunnel's endpoints.
         """
         slug = normalise_slug(slug)
+        # Loaded before the early return: unchaining is itself a via change,
+        # and for a proxy it is the one that must be refused.
+        tunnel = self.tunnel(slug)
         if not via:
+            if tunnel is not None and tunnel.kind is TunnelKind.PROXY:
+                raise ValidationError(
+                    f"{slug} is a proxy and always routes through a tunnel. "
+                    f"Dialled directly, the proxy provider would see this "
+                    f"gateway's real address. Move it to another entry "
+                    f"instead.")
             return
         via = normalise_slug(via)
         if via == slug:
             raise ValidationError(f"{slug!r} cannot route through itself")
-        tunnel = self.tunnel(slug)
         parent = self.tunnel(via)
         if tunnel is None:
             raise ValidationError(f"no tunnel named {slug!r}")
         if parent is None:
             raise ValidationError(f"no tunnel named {via!r} to route through")
+        if parent.kind is TunnelKind.PROXY:
+            raise ValidationError(
+                f"nothing can route through {via}: it is a proxy, which "
+                f"carries TCP only, and a tunnel inside it would carry nothing")
+        if tunnel.kind is TunnelKind.PROXY:
+            if parent.via:
+                raise ValidationError(
+                    f"{via} is itself chained. A proxy needs an entry tunnel "
+                    f"that leaves over the uplink, so the whole path stays "
+                    f"within two hops.")
+            if not parent.enabled:
+                raise ValidationError(
+                    f"{via} is switched off. A proxy's entry has to be a "
+                    f"tunnel that is enabled.")
 
         ancestry = self.chain_of(parent)
         if any(t.slug == slug for t in ancestry):
@@ -419,12 +457,18 @@ class Database:
                 for m in members:
                     tr = list(
                         self._conn.execute(
-                            "SELECT id FROM tunnel WHERE slug = ?",
+                            "SELECT id, kind FROM tunnel WHERE slug = ?",
                             (m.tunnel_slug,),
                         )
                     )
                     if not tr:
                         raise ValidationError(f"unknown tunnel {m.tunnel_slug!r}")
+                    if tr[0]["kind"] == TunnelKind.PROXY.value:
+                        raise ValidationError(
+                            f"{m.tunnel_slug} is a proxy, and proxies can't "
+                            f"join a pool yet: failing over between a VPN and "
+                            f"a proxy would silently change what works for a "
+                            f"client, because only one of them carries UDP.")
                     self._conn.execute(
                         "INSERT INTO pool_member (pool_id, tunnel_id, priority)"
                         " VALUES (?,?,?)",

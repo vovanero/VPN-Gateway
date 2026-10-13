@@ -32,6 +32,7 @@ LOCAL_TOKEN = SECRETS_DIR / "local.token"  # root-only CLI credential
 KILLSWITCH_NFT = ETC / "killswitch.nft"  # boot-time fail-closed skeleton
 RUNTIME_NFT = RUN / "ruleset.nft"        # full generated ruleset
 WG_RUNTIME = RUN / "wg"                  # generated wg setconf files (tmpfs)
+PROXY_RUNTIME = RUN / "proxy"            # redsocks/pxdns configs (tmpfs, 0600)
 OVPN_RUNTIME = RUN / "ovpn"              # generated openvpn configs
 TUNNEL_STATE = RUN / "tunnels"           # per-tunnel env written by up scripts
 
@@ -99,7 +100,21 @@ BLACKHOLE_METRIC = 1000
 SLUG_MAX_LEN = 10
 WG_PREFIX = "wg-"
 OVPN_PREFIX = "tun-"
+# A proxy egress's host-side veth. Its peer lives in the egress's own network
+# namespace, NETNS_PREFIX + slug, where redsocks runs. The namespace prefix is
+# kept distinct from the self-test's ("vpngw-test") so an orphan sweep of one
+# can never remove the other.
+PROXY_PREFIX = "px-"
+NETNS_PREFIX = "vpngw-px-"
 DUMMY_IFACE = "vpngw0"     # carries the per-egress resolver addresses
+
+# Proxy egress plumbing. Link-local, so it cannot collide with anything an
+# operator would put on a LAN, and arithmetic (see proxy_link) rather than
+# allocated, for the same reason resolver_ip is: it survives a restart, a
+# database restore and a rollback without a table to keep in step.
+PROXY_LINK_NET = ipaddress.ip_network("169.254.240.0/20")
+PROXY_RELAY_PORT = 12345   # redsocks, inside the namespace
+PROXY_DNS_PORT = 5353      # pxdns, inside the namespace
 
 
 def local_token() -> str:
@@ -149,6 +164,13 @@ def write_secret(path: Path, text: str) -> None:
 
 def table_for(esid: int) -> int:
     return TABLE_BASE + esid
+
+
+def proxy_link(esid: int) -> tuple[str, str]:
+    """(host end, namespace end) of a proxy egress's veth: one /30 per esid."""
+    base = int(PROXY_LINK_NET.network_address) + 4 * esid
+    return (str(ipaddress.ip_address(base + 1)),
+            str(ipaddress.ip_address(base + 2)))
 
 
 def esid_is_pool(esid: int) -> bool:
@@ -567,10 +589,14 @@ class Settings:
             self.net.mgmt_network,
             self.dns.network,
         )
+        px = PROXY_LINK_NET
         for a, b, na, nb in (
             (lan, mgmt, "lan_cidr", "mgmt_cidr"),
             (lan, res, "lan_cidr", "resolver_subnet"),
             (mgmt, res, "mgmt_cidr", "resolver_subnet"),
+            (lan, px, "lan_cidr", "the proxy link range"),
+            (mgmt, px, "mgmt_cidr", "the proxy link range"),
+            (res, px, "resolver_subnet", "the proxy link range"),
         ):
             if a.overlaps(b):
                 problems.append(f"{na} {a} overlaps {nb} {b}")

@@ -50,6 +50,47 @@ ESID_UNALLOCATED = 0
 class TunnelKind(str, Enum):
     WIREGUARD = "wireguard"
     OPENVPN = "openvpn"
+    # A SOCKS5 or HTTP CONNECT proxy, relayed by redsocks inside its own
+    # network namespace and always chained behind a WireGuard or OpenVPN
+    # tunnel. To the rest of the gateway it is a tunnel with an interface -
+    # px-<slug>, a veth into that namespace - which is what lets the kill
+    # switch apply to it unchanged.
+    PROXY = "proxy"
+
+
+PROXY_TYPES = ("socks5", "http")
+
+
+def validate_proxy(proxy: dict) -> dict:
+    """The non-secret half of a proxy: type, server and port.
+
+    Credentials are not here; they live in the 0600 secrets file and are
+    never part of a row, an API response or a log line.
+    """
+    kind = str(proxy.get("type", "")).lower()
+    if kind not in PROXY_TYPES:
+        raise ValidationError(
+            f"proxy type must be one of {', '.join(PROXY_TYPES)}, not {kind!r}")
+    host = str(proxy.get("host", "")).strip().strip("[]")
+    if not host or any(c.isspace() for c in host) or len(host) > 253:
+        raise ValidationError("the proxy needs a server name or address")
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None  # a hostname, resolved through the entry tunnel later
+    # Outside the try: ValidationError is a ValueError, and raising it inside
+    # would have been swallowed by the very except meant for hostnames.
+    if literal is not None and literal.version == 6:
+        raise ValidationError(
+            "IPv6 proxy servers are not supported: this gateway carries no "
+            "IPv6 at all, by design")
+    try:
+        port = int(proxy.get("port", 0))
+    except (TypeError, ValueError):
+        port = 0
+    if not 1 <= port <= 65535:
+        raise ValidationError("the proxy port must be between 1 and 65535")
+    return {"type": kind, "host": host, "port": port}
 
 
 class HealthState(str, Enum):
@@ -96,6 +137,8 @@ class Tunnel:
     # untouched by chaining; only where the *outside* goes changes.
     via: str = ""
     notes: str = ""
+    # Proxy egress only: {"type", "host", "port"}. Never credentials.
+    proxy: dict = field(default_factory=dict)
     id: int | None = None
 
     def __post_init__(self) -> None:
@@ -105,6 +148,15 @@ class Tunnel:
             raise ValidationError(f"{self.slug!r} cannot route through itself")
         if not isinstance(self.kind, TunnelKind):
             self.kind = TunnelKind(self.kind)
+        if self.kind is TunnelKind.PROXY:
+            # Dialling a proxy straight from the gateway would show the proxy
+            # provider this gateway's real address, and send the proxy login
+            # across the ISP's wire in the clear. There is no such mode, so
+            # there is no such object either.
+            if not self.via:
+                raise ValidationError(
+                    f"proxy {self.slug!r} must route through a tunnel")
+            self.proxy = validate_proxy(self.proxy)
         if self.esid != ESID_UNALLOCATED and not (
             config.TUNNEL_ESID_MIN <= self.esid <= config.TUNNEL_ESID_MAX
         ):
@@ -112,12 +164,17 @@ class Tunnel:
 
     @property
     def iface(self) -> str:
-        prefix = (
-            config.WG_PREFIX
-            if self.kind is TunnelKind.WIREGUARD
-            else config.OVPN_PREFIX
-        )
+        prefix = {
+            TunnelKind.WIREGUARD: config.WG_PREFIX,
+            TunnelKind.OPENVPN: config.OVPN_PREFIX,
+            TunnelKind.PROXY: config.PROXY_PREFIX,
+        }[self.kind]
         return prefix + self.slug
+
+    @property
+    def netns(self) -> str:
+        """The proxy egress's network namespace. Empty for other kinds."""
+        return config.NETNS_PREFIX + self.slug if self.kind is TunnelKind.PROXY else ""
 
     @property
     def table(self) -> int:

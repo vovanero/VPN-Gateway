@@ -680,8 +680,9 @@ class ChainedNamesNeverAskTheUplink(unittest.TestCase):
 class UnknownTunnelKindsAreSkipped(unittest.TestCase):
     """A row this version does not understand must not stop the daemon.
 
-    Rolling back past the release that adds proxy egress leaves 'proxy' rows
-    behind. TunnelKind('proxy') used to raise inside db.tunnels(), every
+    Rolling back past a release that adds a tunnel kind leaves rows of that
+    kind behind ('proxy', the first time). TunnelKind() used to raise inside
+    db.tunnels(), every
     reconcile pass failed, and the daemon could not start - fail-closed, but
     a total outage for a rollback. Skipped instead: the row's interface is
     never built, so its clients have no egress and are dropped.
@@ -698,7 +699,7 @@ class UnknownTunnelKindsAreSkipped(unittest.TestCase):
             "INSERT INTO tunnel (slug, name, kind, esid, enabled, config_path,"
             " mtu, dns, endpoints, endpoint_hosts, via, notes, created_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            ("res-de1", "Residential", "proxy", 2, 1, "", 0,
+            ("res-de1", "Residential", "teleport", 2, 1, "", 0,
              "[]", "[]", "[]", "nl01", "", 0))
 
     def test_listing_survives_a_kind_from_the_future(self):
