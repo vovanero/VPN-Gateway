@@ -70,6 +70,8 @@ PROBE_URL = "https://1.1.1.1/cdn-cgi/trace"
 PROBE_TIMEOUT = 5
 #: How long a diagnosis of a failing proxy is reused before asking again.
 DIAGNOSIS_TTL = 60
+# How long the diagnosis gives one request straight through the proxy.
+DIRECT_TIMEOUT = 15
 _diagnoses: dict[str, tuple[float, dict]] = {}
 
 
@@ -421,8 +423,32 @@ class ProxyDriver(TunnelDriver):
             result = json.loads(res.stdout)
         except (ValueError, TypeError):
             result = {"stage": "relay", "ok": False, "detail": ""}
+        if result.get("stage") == "ok" and not self._direct_request(t, username, password):
+            # It took the handshake, but a whole request through it - asked
+            # directly, around the relay - did not finish either. Then the
+            # proxy is slow or overloaded, and saying "the relay did not
+            # carry it" would send the operator looking in the wrong place:
+            # found with a free proxy that answered every handshake while
+            # taking ten seconds and more to carry anything.
+            result = {"stage": "slow", "ok": False, "detail": ""}
         _diagnoses[t.slug] = (time.time(), result)
         return result
+
+    def _direct_request(self, t: Tunnel, username: str, password: str) -> bool:
+        """The probe's request, straight through the proxy, not the relay.
+
+        The login goes to curl in a config on stdin - never on its command
+        line, where every local account could read it.
+        """
+        scheme = "socks5" if t.proxy["type"] == "socks5" else "http"
+        conf = f'proxy = "{scheme}://{server_of(t)}:{int(t.proxy["port"])}"\n'
+        if username:
+            conf += f'proxy-user = "{username}:{password}"\n'
+        res = try_run(["ip", "netns", "exec", t.netns, "curl", "--silent",
+                       "--fail", "--max-time", str(DIRECT_TIMEOUT), "-K", "-",
+                       "-o", "/dev/null", PROBE_URL],
+                      input_text=conf, timeout=DIRECT_TIMEOUT + 4)
+        return res.ok
 
     def explain(self, t: Tunnel, d: dict) -> str:
         """A diagnosis in the panel's words. Never contains a credential."""
@@ -439,7 +465,10 @@ class ProxyDriver(TunnelDriver):
             }.get(d.get("detail"), "The proxy rejected the username or password."),
             "tunnel": "The proxy accepted the login but would not connect "
                       f"onward: {d.get('detail') or 'no reason given'}.",
-            "ok": "The proxy answers, but the relay did not carry the probe.",
+            "slow": "The proxy answers, but a request through it did not finish "
+                    f"in {DIRECT_TIMEOUT} seconds: it is slow or overloaded right now.",
+            "ok": "The proxy carries a request when asked directly, but the "
+                  "relay did not carry the probe.",
         }.get(d.get("stage"), "The proxy relay stopped. It restarts by itself; "
                               "clients stay blocked meanwhile.")
 

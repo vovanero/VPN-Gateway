@@ -183,16 +183,34 @@ only, no desktop.
 
 ### 2 · Install vpngw
 
-On the VM:
+On the VM, as root, one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/get.sh | bash
+```
+
+A fresh Debian often has `wget` but not `curl`; then:
+
+```bash
+wget -qO- https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/get.sh | bash
+```
+
+Logged in as a user with sudo rather than as root? Put `sudo` before `bash`.
+A minimal Debian has no `sudo` at all; become root with `su -` first.
+
+It downloads the newest release and runs its installer, which asks its
+questions on your terminal. It refuses to run on a machine that already is a
+gateway: that one updates with `vpngw-update`, which fetches through one of
+its tunnels instead of over the uplink. Debian 13 is the supported system;
+Ubuntu is not yet, because the installer does not handle netplan. To read it
+first, download [`get.sh`](get.sh), read it, and run `bash get.sh`. Or, the
+long way round:
 
 ```bash
 git clone https://github.com/vovanero/VPN-Gateway.git
 cd VPN-Gateway
-sudo ./install.sh          # already root, as a fresh Debian often is? drop the sudo
+./install.sh
 ```
-
-A minimal Debian install has no `sudo` at all — if you are logged in as
-root, run `./install.sh` on its own.
 
 The installer detects which adapter is which, then walks through a short
 wizard — uplink address (static or DHCP), client network, whether management
@@ -204,6 +222,12 @@ For unattended provisioning, skip the wizard:
 
 ```bash
 sudo VPNGW_NONINTERACTIVE=1 VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_WAN=1 ./install.sh
+```
+
+or, with the one-line installer:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/get.sh | VPNGW_NONINTERACTIVE=1 VPNGW_WAN=eth0 VPNGW_LAN=eth1 VPNGW_ADMIN_WAN=1 bash
 ```
 
 | Variable | Meaning |

@@ -45,6 +45,9 @@ CANARY_HOST = "203.0.113.9"      # TEST-NET-3, never routed
 CANARY_PORT = 51999
 CANARY_BPF = f"port {CANARY_PORT} or host {CANARY_HOST}"
 
+# How long a request through a proxy exit is given before it counts as failed.
+PROXY_PATIENCE = 20
+
 
 @dataclass
 class Check:
@@ -98,6 +101,10 @@ class Report:
 
 
 class LeakTest:
+    # Seconds a request is given before it counts as failed; run() raises it
+    # for a proxy exit.
+    patience = 8
+
     def __init__(self, service) -> None:
         self.service = service
         self.db = service.db
@@ -255,13 +262,24 @@ class LeakTest:
         report = Report()
         wan = self.settings.net.wan_iface
 
+        proxy = (self.db.tunnel(egress_slug)
+                 if egress_kind is EgressKind.TUNNEL else None)
+        if proxy is not None and proxy.kind is not TunnelKind.PROXY:
+            proxy = None
+        # A proxy exit is slower by design - every connection crosses the
+        # relay, the entry tunnel and the proxy - and a working one often
+        # takes longer than a tunnel's eight seconds. Measured: free proxies
+        # behind a 200 ms entry answered in 2 to 5.5 s. A test that calls a
+        # slow exit dead is wrong, not strict.
+        self.patience = PROXY_PATIENCE if proxy is not None else 8
+
         try:
             self.setup_namespace()
             self.register_client(egress_kind, egress_slug)
             time.sleep(2)
 
             # 1. baseline -------------------------------------------------
-            exit_ip = self._reaches_internet()
+            exit_ip = self._reaches_internet(timeout=self.patience)
             report.add(
                 "tunnel_carries", "tunnel carries traffic",
                 exit_ip is not None,
@@ -291,10 +309,6 @@ class LeakTest:
             )
 
             # 2b. a proxy exit's own way to fail --------------------------
-            proxy = (self.db.tunnel(egress_slug)
-                     if egress_kind is EgressKind.TUNNEL else None)
-            if proxy is not None and proxy.kind is not TunnelKind.PROXY:
-                proxy = None
             if proxy is not None:
                 self._check_proxy(report, proxy, exit_ip)
 
@@ -402,10 +416,15 @@ class LeakTest:
     def _check_dns(self, report: Report) -> None:
         # Asking a resolver we never configured. If the answer comes back at
         # all, the DNAT caught it; a client cannot opt out by hard-coding 8.8.8.8.
-        res = self._ns("sh", "-c",
-                       "timeout 5 nslookup example.com 8.8.8.8 2>&1 || true",
-                       timeout=10)
-        answered = "Address" in (res.stdout or "") or "answer" in (res.stdout or "").lower()
+        #
+        # dig with eight seconds, not nslookup: nslookup gives up after two,
+        # and a proxy exit - the lookup goes over TCP through the relay, the
+        # entry tunnel and the proxy - is often slower than that while
+        # working perfectly. Any response at all, even SERVFAIL, came from a
+        # resolver that took a packet addressed to 8.8.8.8.
+        res = self._ns("dig", "+time=8", "+tries=1", "@8.8.8.8", "example.com",
+                       timeout=14)
+        answered = res.ok and "status:" in (res.stdout or "")
         report.add(
             "dns_intercepted", "hard-coded public DNS is intercepted",
             answered,
@@ -537,11 +556,11 @@ class LeakTest:
                          [" IP ", " IP6 "]) as into_ns, \
              self._Watch(t.iface, f"tcp and {to_server}", [label],
                          payload=True) as stream:
-            self._reaches_internet(timeout=8)
+            self._reaches_internet(timeout=self.patience)
             self._canary(count=3)
-            asked = self._ns("dig", "+time=5", "+tries=1",
+            asked = self._ns("dig", f"+time={self.patience}", "+tries=1",
                              f"@{self.settings.dns.resolver_ip(t.esid)}",
-                             f"{label}.example.com", timeout=12)
+                             f"{label}.example.com", timeout=self.patience + 6)
             wan_lines, entry_lines = on_wan.captured(), in_entry.captured()
             ns_udp, in_stream = into_ns.captured(), stream.captured()
         refused = self._delta(before, nft.counters(), "proxy_nontcp_drop")

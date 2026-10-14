@@ -958,5 +958,53 @@ class EveryTunnelPickerWantsARoutedTunnel(unittest.TestCase):
         self.assertIn(self.ROUTED, boot)
 
 
+class TheOneLineInstaller(unittest.TestCase):
+    """get.sh: what curl | bash runs on a machine that is to become a gateway."""
+
+    ROOT = Path(__file__).resolve().parent.parent
+
+    def src(self):
+        return (self.ROOT / "get.sh").read_text(encoding="utf-8")
+
+    def test_nothing_runs_until_the_whole_script_has_arrived(self):
+        """A download cut short must not run half a script: everything is a
+        function, and the only command at the top level is the last line."""
+        lines = [l for l in self.src().splitlines() if l.strip()]
+        self.assertEqual(lines[-1], '[[ -n "${VPNGW_GET_SOURCED:-}" ]] || main "$@"')
+
+    def test_an_existing_gateway_is_sent_to_vpngw_update(self):
+        """This script fetches over the uplink; an update must go through a
+        tunnel."""
+        body = self.src()
+        check = body[body.index("check_host() {"):body.index("resolve_tag() {")]
+        self.assertIn("/opt/vpngw/vpngw/__init__.py", check)
+        self.assertIn("vpngw-update", check)
+        main = body[body.index("main() {"):]
+        self.assertLess(main.index("check_host"), main.index("resolve_tag"))
+
+    def test_the_questions_are_asked_on_the_terminal(self):
+        """Under curl | bash, stdin is the script itself."""
+        body = self.src()
+        run = body[body.index("run_installer() {"):body.index("main() {")]
+        self.assertIn("bash ./install.sh </dev/tty", run)
+
+    def test_release_candidates_are_never_installed_by_accident(self):
+        import re
+        body = self.src()
+        line = next(l for l in body.splitlines() if "tags.json" in l and "grep -o" in l)
+        pattern = line.split("grep -o '", 1)[1].split("'", 1)[0]
+        names = ['"name": "v2.8.3"', '"name": "v2.8.0-rc4"', '"name": "v10.0.0"']
+        self.assertEqual([n for n in names if re.search(pattern, n)],
+                         ['"name": "v2.8.3"', '"name": "v10.0.0"'])
+
+    def test_ubuntu_is_not_tried_without_being_asked(self):
+        """The installer does not handle netplan; on a remote machine a wrong
+        network is a lockout."""
+        body = self.src()
+        start = body.index("        ubuntu)")
+        ubuntu = body[start:body.index(";;", start)]
+        self.assertIn("VPNGW_ALLOW_UBUNTU", ubuntu)
+        self.assertIn("die ", ubuntu)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

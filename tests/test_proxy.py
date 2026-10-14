@@ -757,10 +757,55 @@ class TheDiagnosis(unittest.TestCase):
     def test_the_messages_never_carry_the_login(self):
         from vpngw.tunnels.proxy import ProxyDriver
         t = px("res-de1", 7, host="gate.example.net", port=7000)
-        for stage in ("resolve", "connect", "auth", "tunnel", "ok", "relay"):
+        for stage in ("resolve", "connect", "auth", "tunnel", "ok", "relay", "slow"):
             msg = ProxyDriver().explain(t, {"stage": stage, "detail": "x"})
             self.assertNotIn("p1-secret", msg)
             self.assertTrue(msg.endswith("."), msg)
+
+
+class ASlowProxyIsNotABrokenRelay(unittest.TestCase):
+    """A free proxy took every handshake and then ten seconds and more to
+    carry anything; the panel said "the relay did not carry the probe" and
+    sent the operator looking in the wrong place."""
+
+    def setUp(self):
+        from vpngw.tunnels import proxy
+        self.proxy = proxy
+        self.calls = []
+        self.direct_ok = False
+        self.addCleanup(setattr, proxy, "try_run", proxy.try_run)
+        self.addCleanup(setattr, proxy, "read_credentials", proxy.read_credentials)
+        proxy.read_credentials = lambda slug: ("u1", "p1-secret")
+
+        def fake(argv, **kw):
+            self.calls.append((argv, kw.get("input_text", "")))
+            from types import SimpleNamespace
+            if "vpngw.proxycheck" in argv:
+                return SimpleNamespace(ok=True, stdout='{"stage": "ok", "ok": true, "detail": ""}')
+            return SimpleNamespace(ok=self.direct_ok, stdout="")
+        proxy.try_run = fake
+        self.t = px("res-de1", 7, host="gate.example.net", port=7000)
+        self.t.endpoints = ["203.0.113.50"]
+        self.addCleanup(proxy._diagnoses.pop, "res-de1", None)
+
+    def test_a_handshake_without_a_finished_request_is_a_slow_proxy(self):
+        d = self.proxy.ProxyDriver().diagnose(self.t, fresh=True)
+        self.assertEqual(d["stage"], "slow")
+        self.assertIn("slow or overloaded", self.proxy.ProxyDriver().explain(self.t, d))
+
+    def test_a_proxy_that_carries_it_directly_points_at_the_relay(self):
+        self.direct_ok = True
+        d = self.proxy.ProxyDriver().diagnose(self.t, fresh=True)
+        self.assertEqual(d["stage"], "ok")
+        self.assertIn("relay", self.proxy.ProxyDriver().explain(self.t, d))
+
+    def test_the_direct_request_keeps_the_login_off_the_command_line(self):
+        self.proxy.ProxyDriver().diagnose(self.t, fresh=True)
+        argv, stdin = next(c for c in self.calls if "curl" in c[0])
+        self.assertNotIn("p1-secret", " ".join(argv))
+        self.assertIn("-K", argv)
+        self.assertIn('proxy-user = "u1:p1-secret"', stdin)
+        self.assertIn('proxy = "socks5://203.0.113.50:7000"', stdin)
 
 
 class TheCommandLine(unittest.TestCase):

@@ -1,5 +1,36 @@
 # Changelog
 
+## 2.8.4 - one command to install, and a self-test that waits for a proxy
+
+**Installing is one command:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vovanero/VPN-Gateway/main/get.sh | bash
+```
+
+`get.sh` checks it is root on Debian 13, finds the newest release (never a
+release candidate), downloads it and runs its installer, whose questions are
+asked on the terminal even though the script arrived through a pipe. It
+refuses a machine that already is a gateway - that one updates with
+`vpngw-update`, through a tunnel - and refuses Ubuntu unless asked, because
+the installer does not handle netplan yet and a wrong network on a remote
+machine is a lockout. The whole script is functions until its last line, so a
+download cut short runs nothing.
+
+**Testing proxy exits with real proxies** - four free public ones behind a
+WireGuard entry - found two things too strict and one message wrong:
+
+- The self-test gave a request eight seconds and a lookup five. Through a
+  proxy exit, measured at 2 to 5.5 seconds a request and about 2 a lookup,
+  working proxies failed it. A proxy exit now gets 20 seconds.
+- "Hard-coded public DNS is intercepted" used nslookup, which gives up after
+  two seconds; it now uses dig with eight.
+- A proxy that took every handshake but was too slow to carry a request read
+  "the relay did not carry the probe", blaming the gateway. The diagnosis now
+  sends the same request straight through the proxy, around the relay: if
+  that fails too, it says the proxy is slow or overloaded; only if it works
+  does it point at the relay.
+
 ## 2.8.3 - proxy exits work with a real proxy
 
 The first test with a real proxy behind a real tunnel failed: "The proxy

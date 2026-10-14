@@ -1094,6 +1094,7 @@ const KIND_NAMES = { wireguard: "WireGuard", openvpn: "OpenVPN" };
 const PROXY_STAGE_SHORT = {
   resolve: "name not found", connect: "no answer", auth: "login rejected",
   tunnel: "refused onward", ok: "relay not carrying", relay: "relay stopped",
+  slow: "too slow",
 };
 
 /** The line under a tunnel's name: what it is, its interface, its entry. */
