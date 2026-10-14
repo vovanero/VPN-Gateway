@@ -185,6 +185,12 @@ table inet {NS_TABLE} {{
         type filter hook output priority filter; policy drop;
         oif lo accept
         ct state established,related accept
+        # What out_nat redirected into the relay. This hook still sees the
+        # interface the first route lookup chose, px0, not lo - so "oif lo"
+        # alone dropped every redirected connection. The health probe and
+        # pxdns's lookups never reached the relay, and a working proxy read
+        # as down. Found with the first real proxy behind a real tunnel.
+        ct status dnat ip daddr 127.0.0.1 tcp dport {relay} accept
         oifname "{NS_IFACE}" ip daddr {server} tcp dport {port} accept
     }}
 }}
@@ -267,12 +273,40 @@ class ProxyDriver(TunnelDriver):
         ups = [d for d in (t.dns or []) if ":" not in d]
         return ups or list(config.Settings.load().dns.fallback_upstream)
 
+    def _rendered(self, t: Tunnel, username: str, password: str) -> dict[str, str]:
+        """Everything the namespace runs on, as this version renders it."""
+        return {"namespace.nft": render_namespace_ruleset(t),
+                "redsocks.conf": render_redsocks(t, username, password),
+                "pxdns.json": render_pxdns(self._upstreams(t))}
+
+    def stale(self, t: Tunnel) -> bool:
+        """Whether what runs in the namespace is not what this version builds.
+
+        The namespace's ruleset is loaded once, when the proxy comes up. An
+        update that changes it - or the relay's config, or a server that moved
+        to a new address - changed nothing for a proxy that was already up:
+        2.8.2's namespaces kept dropping the relay's own connections after the
+        fix was installed. The reconciler rebuilds a stale proxy.
+        """
+        try:
+            username, password = read_credentials(t.slug)
+            wanted = self._rendered(t, username, password)
+        except Exception:
+            return False            # cannot render it: rebuilding would not help
+        d = self._runtime(t)
+        for name, text in wanted.items():
+            try:
+                if (d / name).read_text() != text:
+                    return True
+            except OSError:
+                return True
+        return False
+
     def _write_runtime(self, t: Tunnel, username: str, password: str) -> None:
         d = self._runtime(t)
         d.mkdir(parents=True, exist_ok=True)
         os.chmod(d, stat.S_IRWXU)
-        for name, text in (("redsocks.conf", render_redsocks(t, username, password)),
-                           ("pxdns.json", render_pxdns(self._upstreams(t)))):
+        for name, text in self._rendered(t, username, password).items():
             fd = os.open(d / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as fh:
                 fh.write(text)

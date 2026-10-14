@@ -1,5 +1,27 @@
 # Changelog
 
+## 2.8.3 - proxy exits work with a real proxy
+
+The first test with a real proxy behind a real tunnel failed: "The proxy
+answers, but the relay did not carry the probe." A trace inside the proxy's
+namespace showed why. The health probe's connection and pxdns's lookups start
+inside the namespace and are redirected into the relay, but the output hook
+still sees them leaving through px0, not lo - so "oif lo accept" never matched
+and the namespace dropped them. The probe could never pass, a working proxy
+read as down and was taken out of routing, and its clients had no DNS. Client
+connections themselves were unaffected; they arrive from outside and take a
+different path.
+
+- The namespace accepts connections redirected into its relay.
+- A proxy that is already up is rebuilt when what runs in its namespace is not
+  what this version builds - the ruleset, the relay's config, or its server's
+  address. Without this, the fix above would only have reached proxies added
+  after the update.
+
+The negative tests had all passed: they used a proxy that never answers, and
+the diagnosis, which connects without the relay, said so correctly. Only a
+proxy that works could show that the relay never got a connection.
+
 ## 2.8.2 - the updater picks a tunnel the daemon has seen working
 
 - Right after the daemon starts, every enabled tunnel is routed until its

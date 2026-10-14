@@ -284,9 +284,28 @@ class TheNamespace(unittest.TestCase):
         self.assertEqual(accepts, [
             "oif lo accept",
             "ct state established,related accept",
+            "ct status dnat ip daddr 127.0.0.1 tcp dport 12345 accept",
             'oifname "px0" ip daddr 203.0.113.50 tcp dport 7000 accept',
         ])
         self.assertIn("policy drop", out)
+        # Of those, one leaves through px0, and it goes to the server.
+        leaving = [a for a in accepts if "px0" in a or "daddr" in a and "127.0.0.1" not in a]
+        self.assertEqual(leaving, ['oifname "px0" ip daddr 203.0.113.50 tcp dport 7000 accept'])
+
+    def test_redirected_connections_reach_the_relay(self):
+        """out_nat sends the probe's and pxdns's connections to the relay,
+        but the output hook still sees px0 as their interface, not lo. With
+        only "oif lo accept", every one of them was dropped: the probe never
+        passed, a working proxy read as down, and its clients had no DNS -
+        found with the first real proxy behind a real tunnel."""
+        from vpngw.tunnels.proxy import render_namespace_ruleset
+        text = render_namespace_ruleset(self.t)
+        out = text[text.index("chain output {"):]
+        out = out[:out.index("}")]
+        self.assertIn(f"ct status dnat ip daddr 127.0.0.1 tcp dport {config.PROXY_RELAY_PORT} accept", out)
+        nat = text[text.index("chain out_nat {"):]
+        nat = nat[:nat.index("}")]
+        self.assertIn(f"redirect to :{config.PROXY_RELAY_PORT}", nat)
 
     def test_nothing_is_forwarded_inside(self):
         from vpngw.tunnels.proxy import render_namespace_ruleset
@@ -1236,6 +1255,56 @@ class RedsocksArrivesWithTheUpdate(unittest.TestCase):
         branch = branch[:branch.index("\nfi\n")]
         self.assertLess(branch.index("dpkg-query -W -f='${Status}' redsocks"),
                         branch.index('ok "already up to date"'))
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class AnUpdateReachesRunningProxies(unittest.TestCase):
+    """A namespace's ruleset is loaded once, when the proxy comes up. 2.8.3
+    fixed that ruleset - and a proxy already up kept the broken one, because
+    nothing compared what runs with what the new version builds."""
+
+    def setUp(self):
+        from vpngw.tunnels import proxy
+        self.proxy = proxy
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.addCleanup(setattr, config, "PROXY_RUNTIME", config.PROXY_RUNTIME)
+        config.PROXY_RUNTIME = Path(tmp.name)
+        self.addCleanup(setattr, proxy, "read_credentials", proxy.read_credentials)
+        proxy.read_credentials = lambda slug: ("u1", "p1-secret")
+        self.addCleanup(setattr, proxy.ProxyDriver, "_upstreams", proxy.ProxyDriver._upstreams)
+        proxy.ProxyDriver._upstreams = lambda _self, t: ["1.1.1.1", "9.9.9.9"]
+        self.t = px("res-de1", 7, host="gate.example.net", port=7000)
+        self.t.endpoints = ["203.0.113.50"]
+        self.driver = proxy.ProxyDriver()
+        self.driver._write_runtime(self.t, "u1", "p1-secret")
+
+    def test_what_it_wrote_is_current(self):
+        self.assertFalse(self.driver.stale(self.t))
+
+    def test_a_ruleset_from_an_older_version_is_stale(self):
+        (config.PROXY_RUNTIME / "res-de1" / "namespace.nft").write_text("table inet old {}")
+        self.assertTrue(self.driver.stale(self.t))
+
+    def test_a_namespace_built_before_the_ruleset_was_kept_is_stale(self):
+        (config.PROXY_RUNTIME / "res-de1" / "namespace.nft").unlink()
+        self.assertTrue(self.driver.stale(self.t))
+
+    def test_a_server_that_moved_is_stale(self):
+        self.t.endpoints = ["203.0.113.77"]
+        self.assertTrue(self.driver.stale(self.t))
+
+    def test_what_cannot_be_rendered_is_not_rebuilt_forever(self):
+        self.t.endpoints = []
+        self.assertFalse(self.driver.stale(self.t))
+
+    def test_the_reconciler_asks_before_it_decides(self):
+        src = (Path(__file__).resolve().parent.parent / "vpngw/reconciler.py"
+               ).read_text(encoding="utf-8")
+        self.assertLess(src.index("and ifaces.exists(t.iface) and driver.stale(t)"),
+                        src.index("if t.slug in self._reapply:"))
 
 if __name__ == "__main__":
     unittest.main()

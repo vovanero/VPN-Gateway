@@ -362,6 +362,15 @@ class Reconciler:
                 continue
             if t.enabled:
                 expected.add(t.iface)
+                if (t.kind is TunnelKind.PROXY and t.slug not in self._reapply
+                        and ifaces.exists(t.iface) and driver.stale(t)):
+                    # What runs in its namespace is not what this version
+                    # builds: an update changed the ruleset or the relay's
+                    # config, or its server moved. Rebuilt, not left running
+                    # as it was.
+                    self._reapply.add(t.slug)
+                    self.db.log_event("info", t.slug,
+                                      "rebuilding: its configuration changed")
                 if t.slug in self._reapply:
                     self._reapply.discard(t.slug)
                     if ifaces.exists(t.iface):
