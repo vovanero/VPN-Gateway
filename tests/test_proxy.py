@@ -535,7 +535,9 @@ class TheHealthProbe(unittest.TestCase):
     def setUp(self):
         from vpngw.health import HealthMonitor
         from vpngw.tunnels import proxy
-        self.mon = HealthMonitor(config.HealthSettings())
+        # Synchronous here, so each call is one measurement; the threaded
+        # behaviour has tests of its own below.
+        self.mon = HealthMonitor(config.HealthSettings(), background=False)
         self.t = px("res-de1", 7)
         self.calls = []
         self.reply = (True, 612.0, "203.0.113.50", "")
@@ -621,6 +623,67 @@ class TheHealthProbe(unittest.TestCase):
         for _ in range(self.mon.s.fail_threshold):
             h = self.mon.probe(self.t)
         self.assertIs(h.state, HealthState.DOWN)
+
+
+class AProxyProbeNeverHoldsTheLoop(unittest.TestCase):
+    """Four free proxies, two of them slow: the first pass took so long that
+    the daemon's API did not answer within the updater's 36 s, and the update
+    was rolled back. The same loop is what every tunnel's failover waits on."""
+
+    def setUp(self):
+        import threading
+        from vpngw.health import HealthMonitor
+        from vpngw.tunnels import proxy
+        self.mon = HealthMonitor(config.HealthSettings())
+        self.t = px("res-de1", 7)
+        self.release = threading.Event()
+        self.reply = (True, 612.0, "203.0.113.50", "")
+
+        def slow_probe(_self, t):
+            self.release.wait(5)
+            if isinstance(self.reply, Exception):
+                raise self.reply
+            return self.reply
+
+        self.addCleanup(self.release.set)
+        self.addCleanup(setattr, proxy.ProxyDriver, "probe", proxy.ProxyDriver.probe)
+        self.addCleanup(setattr, proxy.ProxyDriver, "healthy_hint",
+                        proxy.ProxyDriver.healthy_hint)
+        proxy.ProxyDriver.probe = slow_probe
+        proxy.ProxyDriver.healthy_hint = lambda _self, t: (None, "")
+
+    def finish(self):
+        self.release.set()
+        self.mon._inflight["res-de1"][0].join(5)
+
+    def test_the_loop_does_not_wait_for_a_slow_probe(self):
+        import time
+        from vpngw.models import HealthState
+        started = time.time()
+        h = self.mon.probe(self.t)
+        self.assertLess(time.time() - started, 1.0)
+        self.assertIs(h.state, HealthState.UNKNOWN)
+        self.assertIsNone(h.exit_ip)
+
+    def test_the_result_is_settled_on_a_later_pass(self):
+        self.mon.probe(self.t)
+        self.finish()
+        h = self.mon.probe(self.t)
+        self.assertEqual((h.exit_ip, h.rtt_ms), ("203.0.113.50", 612.0))
+
+    def test_one_probe_at_a_time(self):
+        self.mon.probe(self.t)
+        first = self.mon._inflight["res-de1"][0]
+        self.mon.probe(self.t)
+        self.assertIs(self.mon._inflight["res-de1"][0], first)
+
+    def test_a_probe_that_throws_has_failed(self):
+        self.reply = RuntimeError("curl vanished")
+        self.mon.probe(self.t)
+        self.finish()
+        h = self.mon.probe(self.t)
+        self.assertEqual(h.consecutive_fail, 1)
+        self.assertIn("curl vanished", h.last_error)
 
 class TheReconciler(unittest.TestCase):
 

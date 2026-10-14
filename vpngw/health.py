@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 
 from .config import HealthSettings
@@ -84,9 +85,19 @@ def exit_ip_via(iface: str, timeout: int = 8) -> str | None:
 
 
 class HealthMonitor:
-    def __init__(self, settings: HealthSettings) -> None:
+    def __init__(self, settings: HealthSettings, *, background: bool = True) -> None:
         self.s = settings
         self.state: dict[str, TunnelHealth] = {}
+        # A driver's own probe - a proxy's HTTPS request through two hops,
+        # and its diagnosis when that fails - can take half a minute, and the
+        # loop that called it is the one every other tunnel's failover waits
+        # on. The daemon's API, too, waits on its first pass. So such probes
+        # run in a thread of their own; the loop collects the result on a
+        # later pass. Found on the reference gateway: four free proxies, two
+        # of them slow, and the API did not answer within the updater's 36 s,
+        # which rolled the update back.
+        self.background = background
+        self._inflight: dict[str, tuple[threading.Thread, dict]] = {}
 
     def get(self, slug: str) -> TunnelHealth:
         if slug not in self.state:
@@ -95,6 +106,7 @@ class HealthMonitor:
 
     def forget(self, slug: str) -> None:
         self.state.pop(slug, None)
+        self._inflight.pop(slug, None)       # a running probe just finishes
 
     def healthy(self, slug: str) -> bool:
         h = self.state.get(slug)
@@ -134,7 +146,10 @@ class HealthMonitor:
             return h
         probe = getattr(driver, "probe", None)
         if probe is not None:
-            ok, rtt, exit_ip, reason = probe(t)
+            result = self._collect(t, probe) if self.background else probe(t)
+            if result is None:
+                return h                    # still measuring: nothing to settle
+            ok, rtt, exit_ip, reason = result
         else:
             ok, rtt = ping_via(t.iface, self.s.probe_target, self.s.probe_timeout)
             exit_ip, reason = None, ""
@@ -146,6 +161,33 @@ class HealthMonitor:
             h.exit_ip = exit_ip
             h.exit_ip_checked = now
         return self._settle(h, ok, "" if ok else (reason or "probe timed out"))
+
+    def _collect(self, t: Tunnel, probe):
+        """Start probe(t) beside the loop, or hand back what it found.
+
+        None while a probe runs - the first call starts it - and its result,
+        once, when it has finished.
+        """
+        running = self._inflight.get(t.slug)
+        if running is None:
+            box: dict = {}
+
+            def measure() -> None:
+                try:
+                    box["result"] = probe(t)
+                except Exception as exc:     # a probe that throws has failed
+                    box["result"] = (False, None, None, f"probe failed: {exc}")
+
+            thread = threading.Thread(target=measure, name=f"probe-{t.slug}",
+                                      daemon=True)
+            self._inflight[t.slug] = (thread, box)
+            thread.start()
+            return None
+        thread, box = running
+        if thread.is_alive():
+            return None
+        del self._inflight[t.slug]
+        return box.get("result")
 
     @staticmethod
     def _settled(h) -> bool:

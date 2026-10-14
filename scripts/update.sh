@@ -343,7 +343,9 @@ fi
 say "checking the new version came up"
 systemctl restart vpngw || true
 HEALTHY=""
-for _ in $(seq 1 12); do
+# A minute: the new daemon answers only after its first pass, which brings
+# every tunnel up. 36 s was enough until a gateway had more to bring up.
+for _ in $(seq 1 20); do
     sleep 3
     systemctl is-active --quiet vpngw || continue
     # The panel answering is the test that matters: a daemon that starts and

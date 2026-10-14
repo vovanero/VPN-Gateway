@@ -1,5 +1,26 @@
 # Changelog
 
+## 2.8.5 - a slow proxy never holds the gateway up
+
+Updating the reference gateway to 2.8.4 rolled itself back: "the new version
+is not answering". It had four free proxies, two of them slow at the time.
+The daemon answers its API only after its first pass, and a proxy's health
+probe - an HTTPS request through two hops, then a diagnosis when it fails -
+ran inside that pass, one proxy after another: up to 25 seconds each with
+2.8.4's new direct request. The update's 36-second check gave up.
+
+The same loop is the one every tunnel's failover waits on, so this was not
+only about updates.
+
+- A proxy's probe runs in a thread of its own. The loop starts it, carries
+  on, and settles the result on a later pass; one probe per proxy at a time.
+  WireGuard and OpenVPN probes are unchanged: bounded at two seconds.
+- `vpngw-update` waits a minute instead of 36 seconds for the new version to
+  answer.
+
+The rollback did what it is there for: the gateway was back on 2.8.3 within
+a minute, its tunnels, proxies and clients untouched.
+
 ## 2.8.4 - one command to install, and a self-test that waits for a proxy
 
 **Installing is one command:**
